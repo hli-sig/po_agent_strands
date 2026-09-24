@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.env
+.env.*
+data/raw/*
+!data/raw/.gitkeep
+
+# FY budget working area: approved source workbooks in, generated Snowflake
+# ingest CSV + audit metadata out. Real financial data — never committed.
+data/fy_budget/**
+!data/fy_budget/input/
+!data/fy_budget/output/
+!data/fy_budget/**/.gitkeep
+
+# FY converter regression fixtures (see pmagent/tools/fy_budget/PROVENANCE.md).
+# The CODE is committed; the fixtures are real budget rows and are not, which is
+# why tests/test_fy_budget_conversion.py skips without them.
+pmagent/tools/fy_budget/fixtures/
+*.log
+.DS_Store
+
+# Handover packages and their endpoint-DLP sidecars can hold real company decks
+# and names (e.g. the sprint review handover behind lesson 8). Never committed.
+*.zip
+*:sec.endpointdlp
