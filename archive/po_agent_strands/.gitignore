@@ -26,6 +26,3 @@ pmagent/tools/fy_budget/fixtures/
 # and names (e.g. the sprint review handover behind lesson 8). Never committed.
 *.zip
 *:sec.endpointdlp
-
-# Windows "downloaded from internet" metadata created when copying files into WSL
-*:Zone.Identifier

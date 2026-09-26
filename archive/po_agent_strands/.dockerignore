@@ -1,0 +1,29 @@
+# An allowlist: nothing enters the image unless it is named here. This is what
+# keeps .env (production Jira credentials), data/, docs/evidence/ (real Jira
+# data) and anything dropped in the folder (zips, decks) out of the image. Only
+# what runs in the image is listed.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!.env.sample
+!main.py
+!web.py
+!pmagent/
+# the entrypoint and the scripts it runs (the rest need a browser or a checkout)
+!scripts/__init__.py
+!scripts/container.py
+!scripts/demo_web.py
+!scripts/smoke.py
+# the course examples, including lesson 8's MCP server
+!docs/learning/examples/
+# the scripted model: the demo and the examples replay through it
+!tests/__init__.py
+!tests/fakes.py
+
+**/__pycache__/
+**/*.py[cod]
+# real budget rows, and a provenance note naming the source machine
+pmagent/tools/fy_budget/fixtures/
+pmagent/tools/fy_budget/PROVENANCE.md

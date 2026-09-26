@@ -1,0 +1,11 @@
+who owns CSCI-1934 and what is it about?
+what's the status of sprint 31?
+search confluence for "enterprise data model" and list the top 3 pages
+add the comment "Smoke test from the Strands rewrite - please ignore" to CSCI-1934
+n
+ok, post that exact comment on CSCI-1934 now
+y
+/new
+Write a PRD from these notes: Finance wants a daily FX rate feed into Snowflake by 7am AEST, AUD base, covering USD, NZD and EUR, with an alert if the feed is late. Owner is the data platform team.
+what files are in the FY budget input folder?
+/exit

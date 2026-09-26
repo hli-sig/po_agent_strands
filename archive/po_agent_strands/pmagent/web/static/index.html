@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PM Agent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&amp;family=Schibsted+Grotesk:wght@400;500;600&amp;family=Silkscreen&amp;display=swap">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/vendor/marked.min.js" defer></script>
+<script src="/static/vendor/purify.min.js" defer></script>
+<script src="/static/app.js" type="module"></script>
+</head>
+<body>
+<header class="menubar" role="banner">
+  <span class="menubar__brand">PM&nbsp;Agent</span>
+  <nav class="menubar__menu" aria-label="Main">
+    <button type="button" id="btn-new" class="menubar__item">New conversation</button>
+    <button type="button" id="btn-help" class="menubar__item" aria-expanded="false" aria-controls="help">Help</button>
+    <a class="menubar__item" href="/api/docs" target="_blank" rel="noopener">API</a>
+  </nav>
+  <span class="menubar__status mono" id="meta-line">connecting…</span>
+</header>
+
+<main class="desk">
+  <section class="window window--chat" aria-labelledby="chat-title">
+    <div class="window__bar">
+      <span class="window__box" aria-hidden="true"></span>
+      <h1 class="window__title" id="chat-title">PM Agent 1.0</h1>
+      <span class="window__tag mono" id="route-badge" title="Which lane handled the last message">no route yet</span>
+    </div>
+
+    <div id="help" class="help" hidden>
+      <p><strong>Ask anything a project manager would.</strong> Sprint health, Jira searches, ticket drafts,
+        PRDs from meeting notes, Confluence pages, the FY budget CSV.</p>
+      <ul class="help__examples">
+        <li><button type="button" class="chip" data-example="What's the status of sprint 31?">What's the status of sprint 31?</button></li>
+        <li><button type="button" class="chip" data-example="Who owns CSCI-1934 and what is it about?">Who owns CSCI-1934 and what is it about?</button></li>
+        <li><button type="button" class="chip" data-example="Search Confluence for the enterprise data model">Search Confluence for the enterprise data model</button></li>
+        <li><button type="button" class="chip" data-example="Write a PRD from these notes: ">Write a PRD from these notes: …</button></li>
+      </ul>
+      <p class="help__note">Anything that writes — a Jira change, a spreadsheet update, a budget CSV —
+        stops and waits for you to <strong>Approve</strong> or <strong>Reject</strong>. The right-hand window
+        shows how the agent got there.</p>
+    </div>
+
+    <ol class="chat" id="chat" aria-live="polite" aria-label="Conversation"></ol>
+
+    <form class="composer" id="composer" autocomplete="off">
+      <label for="message" class="visually-hidden">Message</label>
+      <textarea id="message" name="message" rows="2" maxlength="20000"
+                placeholder="Ask about a sprint, a ticket, a PRD…  (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button type="submit" class="btn btn--ink" id="send">Send</button>
+    </form>
+    <p class="composer__state mono" id="composer-state" aria-live="polite"></p>
+  </section>
+
+  <section class="window window--chain" aria-labelledby="chain-title">
+    <div class="window__bar">
+      <span class="window__box" aria-hidden="true"></span>
+      <h2 class="window__title" id="chain-title">Thinking chain 1.0</h2>
+      <span class="window__tag mono" id="chain-usage">— tokens</span>
+    </div>
+    <div class="chain" id="chain">
+      <p class="chain__empty">Each step the agent takes appears here as it happens: which lane it chose and why,
+        its reasoning when the model shares it, every tool call with its input and output, approvals,
+        and the PRD writer/reviewer passes.</p>
+    </div>
+    <p class="chain__note mono" id="reasoning-note"></p>
+  </section>
+</main>
+
+<div class="token-gate" id="token-gate" hidden>
+  <form class="window token-gate__box" id="token-form">
+    <div class="window__bar"><span class="window__box" aria-hidden="true"></span><h2 class="window__title">Sign in</h2></div>
+    <div class="token-gate__body">
+      <label for="token">This server needs its API token (PMAGENT_API_TOKEN).</label>
+      <input id="token" type="password" autocomplete="off" required>
+      <button class="btn btn--ink" type="submit">Continue</button>
+      <p class="mono token-gate__hint">Kept for this browser tab only.</p>
+    </div>
+  </form>
+</div>
+</body>
+</html>

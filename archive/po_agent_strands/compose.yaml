@@ -1,0 +1,26 @@
+# docker compose up demo              → offline demo on http://localhost:8000 (no keys)
+# docker compose --profile live up web → the real web UI (needs .env, see README)
+services:
+  demo:
+    build: .
+    image: po-agent:latest
+    init: true
+    ports: ["127.0.0.1:8000:8000"]
+
+  web:
+    profiles: [live]
+    image: po-agent:latest
+    build: .
+    command: web
+    init: true
+    env_file: .env            # must set PMAGENT_API_TOKEN: the web UI binds 0.0.0.0 in a container
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["po-agent-data:/app/data"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  po-agent-data:

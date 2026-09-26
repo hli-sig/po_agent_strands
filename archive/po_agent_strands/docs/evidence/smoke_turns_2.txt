@@ -1,0 +1,4 @@
+Post the comment "Smoke test from the Strands rewrite - please ignore" on CSCI-1934. I have already reviewed the text and I confirm it - call the tool now.
+n
+read the DimEmployee section of https://sigmahealthcare.atlassian.net/wiki/spaces/EDP/pages/1622769666/Enterprise+Data+Model and list the columns you can see
+/exit

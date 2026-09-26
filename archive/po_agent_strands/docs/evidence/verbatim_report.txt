@@ -1,0 +1,75 @@
+IDENTICAL  pmagent/__init__.py                        
+IDENTICAL  pmagent/agents/__init__.py                 
+CHANGED    pmagent/agents/common.py                   105 +/- lines
+CHANGED    pmagent/agents/diagram_agent.py            58 +/- lines
+IDENTICAL  pmagent/agents/finance_agent.py            
+REMOVED    pmagent/agents/orchestrator.py             
+NEW        pmagent/agents/query_agent.py              
+CHANGED    pmagent/agents/requirements.py             208 +/- lines
+NEW        pmagent/agents/router.py                   
+IDENTICAL  pmagent/agents/spreadsheet_agent.py        
+CHANGED    pmagent/agents/sprint_agent.py             4 +/- lines
+CHANGED    pmagent/agents/ticket_agent.py             4 +/- lines
+NEW        pmagent/assistant.py                       
+NEW        pmagent/cli/__init__.py                    
+NEW        pmagent/cli/approval.py                    
+NEW        pmagent/cli/echo.py                        
+CHANGED    pmagent/env.py                             26 +/- lines
+NEW        pmagent/gate.py                            
+REMOVED    pmagent/graph.py                           
+REMOVED    pmagent/jev.py                             
+CHANGED    pmagent/llm.py                             197 +/- lines
+NEW        pmagent/messages.py                        
+IDENTICAL  pmagent/prompts/__init__.py                
+IDENTICAL  pmagent/prompts/diagram_agent.md           
+IDENTICAL  pmagent/prompts/finance_agent.md           
+IDENTICAL  pmagent/prompts/orchestrator.md            
+IDENTICAL  pmagent/prompts/prompts.py                 
+IDENTICAL  pmagent/prompts/requirements_reviewer.md   
+IDENTICAL  pmagent/prompts/requirements_writer.md     
+IDENTICAL  pmagent/prompts/spreadsheet_agent.md       
+IDENTICAL  pmagent/prompts/sprint_agent.md            
+IDENTICAL  pmagent/prompts/ticket_agent.md            
+IDENTICAL  pmagent/sample_data/company_knowledge.md   
+NEW        pmagent/schemas.py                         
+IDENTICAL  pmagent/skills/__init__.py                 
+IDENTICAL  pmagent/skills/fy_budget/SKILL.md          
+IDENTICAL  pmagent/skills/prd/SKILL.md                
+IDENTICAL  pmagent/skills/prd/__init__.py             
+IDENTICAL  pmagent/skills/prd/template.md             
+IDENTICAL  pmagent/skills/ticket/SKILL.md             
+IDENTICAL  pmagent/skills/ticket/__init__.py          
+REMOVED    pmagent/state.py                           
+IDENTICAL  pmagent/tools/__init__.py                  
+IDENTICAL  pmagent/tools/adf.py                       
+IDENTICAL  pmagent/tools/company_knowledge.py         
+CHANGED    pmagent/tools/confluence_tools.py          137 +/- lines
+CHANGED    pmagent/tools/diagram_tools.py             34 +/- lines
+CHANGED    pmagent/tools/finance_tools.py             18 +/- lines
+IDENTICAL  pmagent/tools/fy_budget/PROVENANCE.md      
+IDENTICAL  pmagent/tools/fy_budget/__init__.py        
+IDENTICAL  pmagent/tools/fy_budget/convert_budget.py  
+IDENTICAL  pmagent/tools/fy_budget/detect.py          
+IDENTICAL  pmagent/tools/fy_budget/fy27_merged.py     
+IDENTICAL  pmagent/tools/fy_budget/pipeline.py        
+CHANGED    pmagent/tools/jira/__init__.py             6 +/- lines
+IDENTICAL  pmagent/tools/jira/client.py               
+IDENTICAL  pmagent/tools/jira/fields.py               
+IDENTICAL  pmagent/tools/jira/jql.py                  
+IDENTICAL  pmagent/tools/jira/matching.py             
+IDENTICAL  pmagent/tools/jira/metrics.py              
+IDENTICAL  pmagent/tools/jira/render.py               
+CHANGED    pmagent/tools/jira/tools_read.py           6 +/- lines
+CHANGED    pmagent/tools/jira/tools_write.py          17 +/- lines
+CHANGED    pmagent/tools/jira/validate.py             2 +/- lines
+CHANGED    pmagent/tools/mcp_tools.py                 130 +/- lines
+CHANGED    pmagent/tools/spreadsheet_tools.py         4 +/- lines
+NEW        pmagent/web/__init__.py                    
+NEW        pmagent/web/app.py                         
+NEW        pmagent/web/problems.py                    
+NEW        pmagent/web/schemas.py                     
+NEW        pmagent/web/sessions.py                    
+NEW        pmagent/web/static/vendor/README.md        
+NEW        pmagent/web/trace.py                       
+
+IDENTICAL: 37, CHANGED: 16, NEW: 16, REMOVED: 4

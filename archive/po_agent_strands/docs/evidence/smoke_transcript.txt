@@ -1,0 +1,238 @@
+[smoke] BLOCKED POST /rest/api/3/issue
+[smoke] BLOCKED POST /rest/api/3/issue/bulk
+[smoke] BLOCKED PUT /rest/api/3/issue/CSCI-1
+[smoke] BLOCKED POST /rest/api/3/issue/CSCI-1/comment
+[smoke] BLOCKED POST /rest/api/3/issue
+[smoke] BLOCKED POST /v1.0/me/drive/items/x/workbook/tables/t/rows/add
+[smoke] BLOCKED POST /t/oauth2/v2.0/devicecode
+[smoke] write block installed and self-checked
+PM Agent — Jira assistant (Strands edition)
+  Ask about sprints, search Jira, draft and create tickets, or build the
+  FY budget Snowflake-ingest CSV from Finance's workbooks.
+  Anything that writes always pauses for your approval first.
+
+  /new    start a fresh conversation
+  /help   show this again
+  /exit   quit
+
+Jira: https://sigmahealthcare.atlassian.net/  project: CSCI
+Model: openai / gpt-5.6-luna
+
+
+You:   [route: query]
+  -> read_jira_issue_details({"issue_keys": ["CSCI-1934"], "max_comments": 0})
+  | ### CSCI-1934 [Task/To Do] — NZ IQVIA Data Review
+  | Owner: Bhavya Subramaniam | Points: 1 | Flagged: no | Days in status: 0
+  | 
+  | Description:
+  | ### Context
+  | 
+  | - 
+  | 
+  | ### Objective
+  | 
+  | - 
+  | 
+  | ### Steps 
+  | 
+  | 1. 
+  | 
+  | ### Deliverables
+  | 
+  | - 
+  | 
+  | ### Assumptions - (Optional)
+  | 
+  | - 
+  | 
+  | ### Acceptance criteria
+  | 
+  | ### 
+  | 
+  | ### 
+  | 
+  | ### 
+  | 
+  | ### 
+  | 
+  | ### 
+  | 
+  | ###
+  | 
+  | Comments: none.
+
+Agent: CSCI-1934 is owned by **Bhavya Subramaniam**.
+
+It’s about an **NZ IQVIA Data Review**. The ticket currently has no substantive description, acceptance criteria, or comments beyond that title.
+
+You:   [route: sprint]
+  -> get_sprint_status_by_number({"sprint_number": 31})
+  | Supply Chain Sprint 31 (Jira internal sprint ID: 3435)
+  | State: closed | 2026-08-01 -> 2026-08-16
+  | 
+  | Risk level: MODERATE
+  | Completion by story points: 60.7%
+  | 
+  | Total story points: 231.5
+  |   Done:        140.5
+  |   In progress: 4
+  |   Blocked:     63
+  |   To do:       24
+  | 
+  | Issues: 149 (100 done, 2 in progress, 34 blocked, 13 to do)
+  | 
+  | Blocked / flagged:
+  | - CSCI-274 [In Progress] 5 pts, Hamish McDonald — Provision Data Platform Azure Subscriptions (Non-Prod & Prod) with Env Isolation, RBAC and Network Controls
+  | - CSCI-1191 [In Progress] 1 pts, Hamish McDonald — Design for SIT/ UAT environment provision in Azure
+  | - CSCI ...
+
+Agent: **Sprint Health: MODERATE RISK** — Supply Chain Sprint 31 is closed, but substantial work remained incomplete, especially blocked items.
+
+**Progress:** 140.5 of 231.5 story points done (**60.7%**).
+
+**Breakdown:**
+- Done: **140.5 points**
+- In progress: **4 points**
+- Blocked: **63 points**
+- To do: **24 points**
+
+**Blockers / flagged work:**
+- **CSCI-274** — Hamish McDonald — Azure subscription provisioning; in progress and flagged.
+- **CSCI-1191** — Hamish McDonald — SIT/UAT Azure environment design; in progress and flagged.
+- **CSCI-1831** — Phoebe Song — Parquet table ingestion; in progress and flagged.
+- **34 blocked tickets** account for **63 points**, including:
+  - **CSCI-1308, CSCI-1316, CSCI-1523** — source-to-target mapping.
+  - **CSCI-1361, CSCI-1364, CSCI-1367** — rebate data modelling.
+  - **CSCI-1690–CSCI-1693** — bronze metadata ingestion.
+  - **CSCI-1827, CSCI-1828, CSCI-1853** — DBT model work.
+  - Other blocked modelling, ingestion, configuration, and review items.
+
+**Recommendations:**
+1. Triage the **63 blocked points**, prioritising dependencies affecting multiple modelling and ingestion tickets.
+2. Resolve or formally re-scope the three flagged in-progress items: **CSCI-274, CSCI-1191, and CSCI-1831**.
+3. Review the **24 points still To Do** and either carry them forward with owners and dates or remove them from the active delivery commitment.
+
+You:   [route: query]
+  -> search_confluence({"query": "enterprise data model", "space": "", "limit": 3})
+  | 3 Confluence result(s) for 'enterprise data model':
+  | - EDP CDS Extracts (page 936804360, space Enterprise Data Platform)
+  |     This page contains details about the SAP extractors used in the EDP project. Overview There are two options for delta handling when working with ODP extracts:- Generic Timestamp / Date based Delta Cha
+  |     https://sigmahealthcare.atlassian.net/wiki/spaces/EDP/pages/936804360/EDP+CDS+Extracts
+  | - 4.4.3 Year 2024 Roadmap (page 896532481, space Enterprise Data Platform)
+  |     Overview The SIGMA Data Team currently supports seven main batches: EDP Batch MPS Batch CHS/SHL Batch IBP ...
+
+Agent: Top 3 Confluence pages matching **“enterprise data model”**:
+
+1. **EDP CDS Extracts** — page `936804360`  
+   https://sigmahealthcare.atlassian.net/wiki/spaces/EDP/pages/936804360/EDP+CDS+Extracts
+
+2. **4.4.3 Year 2024 Roadmap** — page `896532481`  
+   https://sigmahealthcare.atlassian.net/wiki/spaces/EDP/pages/896532481/4.4.3+Year+2024+Roadmap
+
+3. **9.1 Standard Operating Environment** — page `817758240`  
+   https://sigmahealthcare.atlassian.net/wiki/spaces/EDP/pages/817758240/9.1+Standard+Operating+Environment
+
+You:   [route: ticket]
+
+Agent: You asked to add this comment to **CSCI-1934**:
+
+> Smoke test from the Strands rewrite - please ignore
+
+Because Jira comments are visible to the whole project and cannot be edited or deleted from here, please confirm that you want me to post it.
+
+You: 
+Agent: Understood — I did not post the comment to **CSCI-1934**.
+
+You:   -> add_jira_comment({"issue_keys": ["CSCI-1934"], "comment": "Smoke test from the Strands rewrite - please ignore"})
+
+------------------------------------------------------------
+APPROVAL REQUIRED — the agent wants to make a change
+
+  Comment on 1 issue(s): CSCI-1934
+
+    | Smoke test from the Strands rewrite - please ignore
+------------------------------------------------------------
+Approve? [y/N] Approved.
+[smoke] BLOCKED POST /rest/api/3/issue/CSCI-1934/comment
+  | Error: RuntimeError - smoke: write blocked
+
+Agent: I couldn’t post the comment to **CSCI-1934** because the Jira write was blocked by the system. No comment was added.
+
+You: Started a new conversation.
+
+You:   [route: requirements]
+
+Agent: # Daily FX Rate Feed into Snowflake
+
+| | |
+|---|---|
+| **Target release** | Not specified |
+| **Document owner** | Data Platform Team |
+| **Stakeholders** | Finance |
+
+## Objective
+
+Provide Finance with a reliable daily foreign-exchange rate feed in Snowflake by 7:00am AEST. The feed will use AUD as the base currency and include USD, NZD, and EUR rates, with an alert when the feed is late so issues can be addressed promptly.
+
+## Background
+
+Finance requires daily FX rates available in Snowflake for downstream financial reporting and analysis. The source system for the rates, the exact Snowflake destination, rate definition, and alerting channel were not specified.
+
+## Success metrics
+
+| Goal | Metric |
+|------|--------|
+| Make daily FX rates available to Finance on time | FX rate feed is available in Snowflake by 7:00am AEST on each scheduled business day |
+| Provide the required currency coverage | Each daily feed contains AUD-base rates for USD, NZD, and EUR |
+| Detect delayed delivery | An alert is generated whenever the feed is not available by 7:00am AEST |
+
+## Assumptions
+
+- Snowflake is the required destination for the feed.
+- AUD is the base currency for all delivered rates.
+- The feed runs daily, although whether this includes weekends and public holidays is not specified.
+- The Data Platform Team owns implementation and operation.
+- Finance is the primary consuming stakeholder.
+
+## Requirements
+
+| # | User story | Importance | Jira | Notes |
+|---|------------|------------|------|-------|
+| 1 | As a Finance user, I want daily FX rates loaded into Snowflake with AUD as the base currency, so that I can use consistent rates for financial reporting and analysis. | High | — | The feed must include rates for USD, NZD, and EUR. |
+| 2 | As a Finance user, I want the daily FX feed to be available by 7:00am AEST, so that downstream finance processes can use the rates at the start of the business day. | High | — | The required delivery timezone is AEST. |
+| 3 | As a Data Platform Team operator, I want the FX feed to be monitored for late delivery, so that I can respond when the daily data is not available on time. | High | — | An alert is required if the feed is late. |
+
+## User interaction and design
+
+No user interface or design requirements were provided. The alerting experience and delivery channel remain to be defined.
+
+## Open questions
+
+| Question | Answer |
+|----------|--------|
+| What is the source provider or system for the FX rates? | _Open_ |
+| What Snowflake database, schema, table, and data contract should be used? | _Open_ |
+| What rate type and calculation convention are required (for example, spot, closing, or mid-market rate)? | _Open_ |
+| Does “daily” include weekends and public holidays, or only business days? | _Open_ |
+| Which alerting channel and recipients should be used for late-feed alerts? | _Open_ |
+| How late must the feed be before the alert is triggered, and should there be escalation or retry behavior? | _Open_ |
+| What target release date and named owner/contact within the Data Platform Team apply? | _Open_ |
+
+## Out of scope
+
+- FX rates for currencies other than USD, NZD, and EUR.
+- A base currency other than AUD.
+- Any user interface or reporting experience beyond delivering the feed into Snowflake.
+- The FX rate source/provider, rate methodology, Snowflake object design, and alerting channel, which were not specified in the source notes.
+
+You:   [route: finance]
+  -> inspect_fy_budget_inputs({})
+  | Could not read FY budget inputs: FyBudgetError: Input folder does not exist: data/fy_budget/input. Put the approved workbooks there, or pass input_dir explicitly.
+
+Agent: The FY budget input folder could not be read because it does not exist:
+
+`data/fy_budget/input`
+
+Please place the approved budget workbooks there, or provide the correct input folder path.
+
+You: Bye.

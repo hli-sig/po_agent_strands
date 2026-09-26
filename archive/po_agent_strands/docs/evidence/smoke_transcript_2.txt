@@ -1,0 +1,70 @@
+[smoke] BLOCKED POST /rest/api/3/issue
+[smoke] BLOCKED POST /rest/api/3/issue/bulk
+[smoke] BLOCKED PUT /rest/api/3/issue/CSCI-1
+[smoke] BLOCKED POST /rest/api/3/issue/CSCI-1/comment
+[smoke] BLOCKED POST /rest/api/3/issue
+[smoke] BLOCKED POST /v1.0/me/drive/items/x/workbook/tables/t/rows/add
+[smoke] BLOCKED POST /t/oauth2/v2.0/devicecode
+[smoke] write block installed and self-checked
+PM Agent — Jira assistant (Strands edition)
+  Ask about sprints, search Jira, draft and create tickets, or build the
+  FY budget Snowflake-ingest CSV from Finance's workbooks.
+  Anything that writes always pauses for your approval first.
+
+  /new    start a fresh conversation
+  /help   show this again
+  /exit   quit
+
+Jira: https://sigmahealthcare.atlassian.net/  project: CSCI
+Model: openai / gpt-5.6-luna
+
+
+You:   [route: ticket]
+  -> add_jira_comment({"issue_keys": ["CSCI-1934"], "comment": "Smoke test from the Strands rewrite - please ignore"})
+
+------------------------------------------------------------
+APPROVAL REQUIRED — the agent wants to make a change
+
+  Comment on 1 issue(s): CSCI-1934
+
+    | Smoke test from the Strands rewrite - please ignore
+------------------------------------------------------------
+Approve? [y/N] Rejected — nothing was written.
+  | The user rejected this action. Nothing was written. Ask what they would like changed.
+
+Agent: The comment was not posted because the action was rejected. Nothing was changed in Jira.
+
+You:   [route: query]
+  -> read_confluence_page({"page": "https://sigmahealthcare.atlassian.net/wiki/spaces/EDP/pages/1622769666/Enterprise+Data+Model", "section": "Dim ...})
+  | Enterprise Data Model > DimEmployee (page 1622769666)
+  | 
+  | ## DimEmployee
+  | 
+  | The employee dimension captures details of employees involved in store, warehouse, sales, management etc…, allowing analysis by attributes such as role, department, region etc…
+  | 
+  | ### Platinum
+  | 
+  | Updated - 24/07/2026 - Removal of Gender and Phone fields, and the addition of EmploymentType and IsPharmicist.
+  | 
+  | ---
+  | 
+  | This section's detail is in 1 image(s), which follow this text in order, 1 to 1, each announced by a label. Read them as part of the page — on these pages the column definitions are usually only in the image.
+  | Confluence ...
+
+Agent: Columns visible in **DimEmployee**:
+
+- EmployeeKey — PK
+- Code — varchar
+- HomeStoreKey — nullable
+- FirstName — varchar
+- LastName — varchar
+- CardNo — varchar
+- JobDesc — varchar
+- EmploymentType — varchar
+- IsPharmicist — bool
+- IsActive — bool
+- IsCurrent — bool
+- DateEffective — datetime
+- DateExpire — datetime
+
+You: Bye.
