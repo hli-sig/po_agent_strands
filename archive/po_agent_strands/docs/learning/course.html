@@ -1905,81 +1905,161 @@ passes, and every D-step's table is covered. Why it matters: every tool the
 agents will call now works, and is tested, before a single agent exists. That is
 what "the framework is a thin layer" means in practice.</p>
 <h2>R2 — The scripted model, the model layer, and the tools that need a model (1 day)</h2>
-<ol>
-<li><code>➕ tests/fakes.py</code> [lesson 9]: the scripted model every later test uses. A
-    Strands <code>Model</code> needs <code>update_config</code>, <code>get_config</code>, <code>structured_output</code> and
-    <code>stream</code>; only <code>stream</code> matters.<ul>
-<li><code>text(value)</code> → <code>{"text": value}</code>; <code>reasoning(value)</code> →
- <code>{"reasoningContent": {"text": value}}</code>; <code>call(name, **args)</code> →
- <code>{"toolUse": {"name": name, "toolUseId": "tooluse_&lt;n&gt;", "input": args}}</code> with
- a fresh id each time; <code>structured(Schema, **fields)</code> →
- <code>call(Schema.__name__, **Schema(**fields).model_dump(by_alias=True))</code>,
- because structured output is a call to a hidden tool named after the schema
- (lesson 3).</li>
-<li><code>ScriptedModel(turns)</code>: <code>get_config</code>/<code>update_config</code> keep a small dict, and
- <code>structured_output</code> raises <code>NotImplementedError</code> (agents never call it; they
- use the hidden tool). Each turn is a list of blocks, or a function
- <code>messages -&gt; blocks</code> for a reply that depends on the conversation.
- <code>stream(messages, tool_specs=None, system_prompt=None, **kw)</code> is an async
- generator. It records <code>{"system_prompt", "tools" (the spec names),
- "messages" (a deep copy)}</code> in <code>self.requests</code>, pops the next turn (an
- <code>AssertionError</code> if there is none), and yields:
- <code>{"messageStart": {"role": "assistant"}}</code>; then per block a
- <code>contentBlockStart</code> (with <code>{"start": {"toolUse": {"name", "toolUseId"}}}</code> for a
- tool call, else <code>{"start": {}}</code>), one <code>contentBlockDelta</code> (<code>{"delta": {"text":
- …}}</code>, <code>{"delta": {"reasoningContent": {"text": …}}}</code> or <code>{"delta": {"toolUse":
- {"input": &lt;the args as a JSON string&gt;}}}</code>) and a <code>contentBlockStop</code>; then
- <code>{"messageStop": {"stopReason": "tool_use"}}</code> if any block was a call, else
- <code>"end_turn"</code>; then <code>{"metadata": {"usage": {"inputTokens": 0, "outputTokens":
- 0, "totalTokens": 0}, "metrics": {"latencyMs": 0}}}</code>. A <code>remaining</code> property
- counts the turns left.</li>
+<p>Four files, in the order you need them: a fake model your tests will run against (you can't hit a real LLM offline), the one place a real model gets built, and two tools that need a model at runtime — one calling a server you don't own.</p>
+<h4><code>➕ tests/fakes.py</code> [lesson 9] — a fake Strands <code>Model</code> that replays scripted replies, so every later test drives the real agent loop with no network and no API key</h4>
+<p>A Strands <code>Model</code> is any object with <code>update_config</code>, <code>get_config</code>, <code>structured_output</code> and <code>stream</code>. Only <code>stream</code> matters here — Strands' event loop calls it, assembles the events it yields into an assistant message, runs any tool calls, and calls it again. A fake that just replays a fixed script of replies through that same interface exercises the real loop, the real hooks, and the real interrupt machinery; only the model's "choices" are canned.</p>
+<p><strong>Block helpers</strong> — each returns one block dict, ready to drop into a scripted turn:</p>
+<ul>
+<li><code>text(value) -&gt; {"text": value}</code> — a plain assistant reply.</li>
+<li><code>reasoning(value) -&gt; {"reasoningContent": {"text": value}}</code> — a reasoning block, the kind a thinking model streams before its answer.</li>
+<li><code>call(name, **args) -&gt; {"toolUse": {"name": name, "toolUseId": "tooluse_&lt;n&gt;", "input": args}}</code>, with <code>&lt;n&gt;</code> a fresh number every time (a module-level counter).<ul>
+<li><strong>Why a fresh id:</strong> every <code>toolUse</code> needs a <code>toolUseId</code> unique within the conversation, because the matching <code>toolResult</code> references it by that id (lesson 4). Reusing an id would silently pair a result with the wrong call.</li>
 </ul>
 </li>
-<li><code>➕ pmagent/llm.py</code> [lesson 1, lesson 3]:<ul>
-<li><code>build_model()</code> picks from env: <code>AnthropicModel(client_args={"api_key": …},
- model_id=LLM_MODEL, max_tokens=LLM_MAX_TOKENS)</code>; for OpenAI with reasoning
- effort <code>none</code>, <code>OpenAIModel(…, params={"reasoning_effort": "none",
- "temperature": 0.1})</code> (gpt-5.x rejects function tools on chat completions
- without that effort); any other effort, <code>OpenAIResponsesModel(…,
- params={"reasoning": {"effort": …}})</code>, adding <code>"summary"</code> only when
- <code>LLM_REASONING_SUMMARY</code> is set. An unknown provider
- raises <code>ValueError</code>. Provider imports are lazy.</li>
-<li><code>get_model()</code> caches <code>build_model()</code> for the process.</li>
-<li><code>structured(schema, prompt, *, system_prompt=None, model=None)</code> runs a
- <strong>fresh</strong> <code>Agent</code> per call: <code>callback_handler=None</code>, <code>messages=[]</code>, no hooks,
- <code>structured_output_model=schema</code>, and returns <code>result.structured_output</code>. A
- fresh agent keeps the hidden output tool out of every real conversation.</li>
-<li><code>invocation_usage(result)</code> reads <code>result.metrics.latest_agent_invocation</code>
- and returns <code>{"input_tokens", "output_tokens", "total_tokens",
- "model_calls"}</code> (the last is its number of cycles).</li>
-<li><code>reasoning_available()</code>: true only for OpenAI with a reasoning effort other
- than <code>none</code> and a reasoning summary set.</li>
+<li><code>structured(schema, **fields) -&gt; call(schema.__name__, **schema(**fields).model_dump(by_alias=True))</code>.<ul>
+<li><strong>Why:</strong> structured output is never a special reply type — Strands gets it by adding a hidden tool named after the schema and waiting for the model to call it (lesson 3). So the only way to script a structured reply is to script a tool call to that hidden tool, built by constructing the real Pydantic object and dumping it back to a dict.</li>
 </ul>
 </li>
-<li><code>➕ pmagent/tools/diagram_tools.py</code> [lesson 2, lesson 3]:<ul>
-<li><code>_DIAGRAM_BRIEF_ROLE</code>: instructions to pick one diagram type and describe it
- using only what the source says.</li>
-<li><code>_build_prompt(prd_text, reporting_intent_text="")</code> adds a
- <code>Reporting Intent brief:</code> section only when one is given.</li>
-<li><code>render_diagram_brief(brief)</code> is plain Python: <code>Diagram type: …</code>, <code>Title: …</code>,
- the description, <code>Nodes:</code> (<code>- id: label</code>) and <code>Edges:</code> (<code>- a -&gt; b (label)</code>,
- no brackets when there's no label).</li>
-<li><code>draft_diagram_brief(prd_text, reporting_intent_text="")</code> is
- <code>@tool(context=True)</code>: it calls <code>structured(DiagramBrief, …,
- model=tool_context.agent.model)</code>, so the brief uses the calling lane's model,
- including a test's scripted one. <code>READ_TOOLS = [draft_diagram_brief]</code>.</li>
+</ul>
+<p><strong><code>ScriptedModel(turns=None)</code></strong></p>
+<ul>
+<li><strong>Does (constructor):</strong> stores <code>turns</code> as a list (each entry is <em>one model call's</em> reply), an empty <code>requests</code> list, and <code>config = {"model_id": "scripted"}</code>.</li>
+<li><code>update_config(**kw)</code> / <code>get_config()</code>: trivial dict passthrough — present only because the <code>Model</code> interface requires them; nothing in this course reads them back.</li>
+<li><code>structured_output(...)</code>: raises <code>NotImplementedError</code>.<ul>
+<li><strong>Why:</strong> Strands never calls this method for <code>structured_output_model=</code> — see <code>structured()</code> above. If you find yourself calling it, script a <code>structured()</code> reply instead.</li>
 </ul>
 </li>
-<li><code>➕ pmagent/tools/mcp_tools.py</code> [lesson 8]: <code>APPROVED_READ_TOOLS =
-    frozenset()</code>; <code>MCPSession(client, tools)</code> with <code>close()</code> (it calls
-    <code>client.stop(None, None, None)</code>: <code>stop</code> is a context-manager exit and has no
-    defaults); and <code>start_lucid()</code> (R6's <code>main.py</code> calls it only when
-    <code>LUCID_MCP_ENABLED</code> is true),
-    which builds <code>MCPClient(url=LUCID_MCP_URL, headers={"Authorization": "Bearer
-    …"} or None)</code>, calls <code>start()</code> explicitly, lists <strong>every page</strong> of tools
-    (<code>list_tools_sync(pagination_token=…)</code> until the token is <code>None</code>), and on any
-    failure prints a warning, stops the client and returns <code>None</code>.</li>
+<li><strong><code>stream(messages, tool_specs=None, system_prompt=None, **kwargs)</code></strong> — an async generator; this is the method Strands actually drives. Steps, in order:<ol>
+<li>Append one record to <code>self.requests</code>: <code>{"system_prompt": system_prompt, "tools": [spec["name"] for spec in tool_specs or []], "messages": copy.deepcopy(messages)}</code>.
+ - <strong>Why deep-copy:</strong> <code>messages</code> is the live conversation list; Strands keeps mutating it after this call returns. Recording a snapshot lets a test later assert what the model was shown <em>at the time</em>, not what the list looks like now.</li>
+<li>If <code>self.turns</code> is empty, raise <code>AssertionError("ScriptedModel ran out of scripted turns")</code>.
+ - <strong>Why:</strong> a test that runs out of scripted replies should fail loudly and immediately, not hang or silently return nothing.</li>
+<li>Pop the next turn off the front of the list (<code>self.turns.pop(0)</code>). If it's callable, call it with <code>messages</code> and use the returned list of blocks; otherwise the turn <em>is</em> the list of blocks.
+ - <strong>Why a callable turn:</strong> most scripted replies don't care what's in the conversation, but occasionally a test needs a reply that depends on it (e.g. echoing back an id the model was just given). A plain list can't do that; a function can.</li>
+<li>Yield <code>{"messageStart": {"role": "assistant"}}</code>.</li>
+<li>For each block in the turn's blocks, yield one <code>contentBlockStart</code> / <code>contentBlockDelta</code> / <code>contentBlockStop</code> triple:
+ - a <code>reasoningContent</code> block → delta <code>{"reasoningContent": {"text": ...}}</code>;
+ - a <code>text</code> block → delta <code>{"text": ...}</code>;
+ - a <code>toolUse</code> block → <code>contentBlockStart</code> carries <code>{"toolUse": {"name", "toolUseId"}}</code>, and the delta is <code>{"toolUse": {"input": json.dumps(use["input"])}}</code> — the arguments as a <strong>JSON string</strong>, not a dict, because that's the wire shape Strands' real parser expects to accumulate and decode. Track that at least one block was a tool call.</li>
+<li>Yield <code>{"messageStop": {"stopReason": "tool_use" if any block was a call else "end_turn"}}</code>.</li>
+<li>Yield one <code>{"metadata": {"usage": {...all zero...}, "metrics": {"latencyMs": 0}}}</code> block. The numbers are zero because nothing real happened; only their <em>shape</em> has to match what Strands expects.</li>
 </ol>
+</li>
+<li><strong><code>remaining</code> property:</strong> <code>len(self.turns)</code> — lets a test assert every scripted reply actually got consumed (a leftover turn usually means the code under test made fewer model calls than the test expected).</li>
+</ul>
+<h4><code>➕ pmagent/llm.py</code> [lesson 1, lesson 3] — the one place a model provider gets chosen, plus the one helper for stateless structured-output calls</h4>
+<p><strong><code>build_model() -&gt; Model</code></strong></p>
+<ul>
+<li><strong>Does:</strong> branches on <code>env.LLM_PROVIDER</code>:<ol>
+<li><code>"anthropic"</code> → lazily import <code>AnthropicModel</code>; return <code>AnthropicModel(client_args={"api_key": env.ANTHROPIC_API_KEY}, model_id=env.LLM_MODEL, max_tokens=env.LLM_MAX_TOKENS)</code>.</li>
+<li><code>"openai"</code> → read <code>effort = env.LLM_REASONING_EFFORT</code>.
+ - If <code>effort == "none"</code>: lazily import <code>OpenAIModel</code>; return it with <code>params={"reasoning_effort": "none", "temperature": 0.1}</code>.
+ - Otherwise: lazily import <code>OpenAIResponsesModel</code>; build <code>reasoning = {"effort": effort}</code>, adding <code>reasoning["summary"] = env.LLM_REASONING_SUMMARY</code> only when that setting is non-empty; return <code>OpenAIResponsesModel(..., params={"reasoning": reasoning})</code>.</li>
+<li>Anything else → <code>raise ValueError(f"Unknown LLM_PROVIDER={env.LLM_PROVIDER!r}. Use 'anthropic' or 'openai'.")</code>.</li>
+</ol>
+</li>
+<li><strong>Why lazy imports:</strong> each provider needs its own SDK installed; importing only the branch you take means you never need the SDK for a provider you don't use.</li>
+<li><strong>Why the OpenAI split is mandatory, not stylistic:</strong> gpt-5.x rejects function tools on the <code>/v1/chat/completions</code> endpoint unless <code>reasoning_effort</code> is explicitly sent as <code>"none"</code> — verified live as an HTTP 400 ("Function tools with reasoning_effort are not supported ..."). Every lane binds tools, and structured output is itself a hidden tool call, so this app always needs tools to work — the <code>"none"</code> branch is not optional. Sending <code>reasoning_effort</code> at all also happens to re-enable <code>temperature</code> on gpt-5 (a side effect worth knowing, not a feature to rely on).</li>
+<li><strong>Watch out:</strong> do not add <code>max_tokens</code> to the <code>"none"</code>-effort <code>OpenAIModel</code> branch — gpt-5 rejects that parameter on this endpoint. Any real reasoning effort needs the Responses API (<code>OpenAIResponsesModel</code>) instead, because only it supports tools and reasoning together.</li>
+</ul>
+<p><strong><code>get_model() -&gt; Model</code></strong> — decorated <code>@functools.cache</code></p>
+<ul>
+<li><strong>Does:</strong> returns <code>build_model()</code>, computed once and cached for the lifetime of the process.</li>
+<li><strong>Why:</strong> correct for a single long-lived CLI process. It is <strong>not</strong> what the web server uses per conversation (R7): the Anthropic model object holds one async HTTP client, and that client must not be shared across the event loops of multiple concurrently running conversations. The web server calls <code>build_model()</code> fresh instead.</li>
+</ul>
+<p><strong><code>reasoning_available() -&gt; bool</code></strong></p>
+<ul>
+<li><strong>Does:</strong> returns <code>True</code> only when all three hold: <code>env.LLM_PROVIDER == "openai"</code>, <code>env.LLM_REASONING_EFFORT != "none"</code>, and <code>env.LLM_REASONING_SUMMARY</code> is set.</li>
+<li><strong>Why:</strong> this is the single check other code uses to decide whether there's any reasoning stream worth showing at all (Anthropic's models here never stream reasoning; OpenAI only does with a non-<code>"none"</code> effort and a summary mode configured).</li>
+</ul>
+<p><strong><code>structured(schema, prompt, *, system_prompt=None, model=None, usage_sink=None) -&gt; T</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Build a <strong>brand-new</strong> <code>Agent</code> for this call alone: <code>model=model or get_model()</code>, <code>system_prompt=system_prompt</code>, <code>messages=[]</code> (empty — no shared history), <code>callback_handler=None</code>, and no <code>hooks=</code> argument at all.</li>
+<li>Call <code>agent(prompt, structured_output_model=schema)</code>.</li>
+<li>If <code>usage_sink</code> was given, call it with <code>invocation_usage(result)</code>.</li>
+<li>Return <code>result.structured_output</code>.</li>
+</ol>
+</li>
+<li><strong>Why a fresh agent every call, not a shared one:</strong> structured output only exists as a hidden tool call inside <em>some</em> agent's conversation (lesson 3). Everything about this agent is built to keep that hidden call from leaking anywhere real: <code>callback_handler=None</code> stops it from being printed to the CLI; the empty <code>messages=[]</code> keeps it out of the shared lane history a user is actually reading; no hooks means no approval gate runs on it, because there is nothing here a human needs to approve.</li>
+<li><strong>Watch out:</strong> never call <code>structured()</code> against a lane's own long-lived <code>Agent</code> — that agent already has hooks and shared history, and you'd break exactly the guarantee above.</li>
+</ul>
+<p><strong><code>invocation_usage(result) -&gt; dict</code></strong></p>
+<ul>
+<li><strong>Does:</strong> reads <code>result.metrics.latest_agent_invocation</code>; if it exists, takes its <code>.usage</code> dict, else uses <code>{}</code>. Returns <code>{"input_tokens": usage.get("inputTokens", 0), "output_tokens": usage.get("outputTokens", 0), "total_tokens": usage.get("totalTokens", 0), "model_calls": len(invocation.cycles) if invocation else 0}</code>.</li>
+<li><strong>Why <code>latest_agent_invocation</code> and not <code>accumulated_usage</code>:</strong> <code>result.metrics.accumulated_usage</code> is a running total over the <em>whole life</em> of the agent object; since <code>structured()</code> builds a fresh agent every time, that would happen to be correct there too, but on a long-lived lane agent it would keep growing across turns. Reading the <em>latest invocation</em> instead always gives you just this one call's numbers, which is what a token-usage-per-turn UI (R7) needs.</li>
+</ul>
+<h4><code>➕ pmagent/tools/diagram_tools.py</code> [lesson 2, lesson 3] — turns an approved PRD into a plain-language diagram brief; never talks to Lucid itself</h4>
+<p>This tool's whole job stops one step short of Lucid: it produces the text a human will later approve and hand to Lucid's own <code>create_diagram</code> MCP tool (next file). Keeping that call out of this module is deliberate — it's the boundary between "the model decides what to diagram" and "a human confirms it gets created."</p>
+<ul>
+<li><strong><code>_DIAGRAM_BRIEF_ROLE</code></strong> — a module-level string constant: the system-prompt text that tells the model to pick exactly one <code>diagram_type</code> (<code>flowchart</code>, <code>entity_relationship</code>, <code>architecture</code>, or <code>sequence</code>), invent no node or edge that isn't explicitly in the source text, and write <code>description</code> as plain English naming every node and how it connects — written so someone with <em>no other context</em> could hand it to a diagramming tool and get the right picture.</li>
+</ul>
+<p><strong><code>_build_prompt(prd_text, reporting_intent_text="") -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> joins <code>[_DIAGRAM_BRIEF_ROLE, f"PRD:\n{prd_text}"]</code> with blank lines, and appends a <code>f"Reporting Intent brief:\n{reporting_intent_text}"</code> section <strong>only</strong> when <code>reporting_intent_text</code> is non-empty.</li>
+<li><strong>Watch out:</strong> the "no brief given" signal is an empty string, not <code>None</code> — pass <code>""</code>, not <code>None</code>, when there isn't one.</li>
+</ul>
+<p><strong><code>render_diagram_brief(brief: DiagramBrief) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does (plain Python, no LLM call):</strong> builds and joins these lines in order — <code>Diagram type: &lt;type&gt;</code>, <code>Title: &lt;title&gt;</code>, a blank line, <code>brief.description</code>, a blank line, <code>Nodes:</code> followed by one <code>- &lt;id&gt;: &lt;label&gt;</code> line per node, a blank line, <code>Edges:</code> followed by one <code>- &lt;from&gt; -&gt; &lt;to&gt;</code> line per edge, with a trailing <code>(&lt;label&gt;)</code> appended only when that edge has a label.</li>
+<li><strong>Why this is deterministic Python and not the model's job:</strong> the same recurring rule as everywhere else in this app — the LLM does judgment (what belongs on the diagram), and plain code does formatting, so the exact same <code>DiagramBrief</code> always renders to the exact same text. This rendered text is also literally what later gets passed as Lucid's <code>create_diagram</code> <code>description</code> argument, so it needs to be stable and predictable, not restyled by the model on every call.</li>
+</ul>
+<p><strong><code>draft_diagram_brief(prd_text, reporting_intent_text="", tool_context=None) -&gt; str</code></strong> — decorated <code>@tool(context=True)</code></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Read <code>tool_context.agent.model</code> if a <code>tool_context</code> was passed, else <code>None</code>.</li>
+<li>Read <code>tool_context.invocation_state.get("usage_sink")</code> the same way (empty dict, so <code>None</code>, if there's no context).</li>
+<li>Call <code>structured(DiagramBrief, _build_prompt(prd_text, reporting_intent_text), model=&lt;that model&gt;, usage_sink=&lt;that sink&gt;)</code>.</li>
+<li>Return <code>render_diagram_brief(brief)</code>.</li>
+</ol>
+</li>
+<li><strong>Why <code>@tool(context=True)</code>:</strong> it makes Strands pass a <code>ToolContext</code> argument — invisible to the model, so it never appears in the tool's schema — carrying the calling agent, the raw <code>tool_use</code> block, and the invocation state. Reading <code>tool_context.agent.model</code> means this brief always runs on <strong>whatever model called it</strong>: a lane's real provider in production, or a test's <code>ScriptedModel</code> — with no extra plumbing to wire that up per caller.</li>
+<li><strong><code>READ_TOOLS = [draft_diagram_brief]</code>, <code>WRITE_TOOLS = []</code>.</strong> It calls an LLM and renders text; it creates nothing and touches no file, so it's a read. (The Lucid tools this same lane also binds can't be declared here at all — they're discovered at runtime. That's the next file.)</li>
+</ul>
+<h4><code>➕ pmagent/tools/mcp_tools.py</code> [lesson 8] — connects to an MCP server you don't own (Lucid), and hands its tools to the diagram lane, gated closed by default</h4>
+<p><code>MCPClient</code> runs its session on a background thread, so once it's started, calling its methods from the rest of this synchronous app just works — no <code>async</code>/<code>await</code> needed anywhere else. The lifecycle this file wraps is meant to be this simple to read:</p>
+<pre class="scroll"><code class="language-python">session = start_lucid()   # start() + list every page of tools, or None on failure
+tools   = session.tools   # give THESE to the Agent — never session.client
+...
+session.close()           # stop the background thread at process exit
+</code></pre>
+<ul>
+<li><strong><code>APPROVED_READ_TOOLS: frozenset[str] = frozenset()</code></strong> — starts empty, on purpose. A tool discovered at runtime can't be listed in a module's <code>READ_TOOLS</code> the way a local <code>@tool</code> can, so the approval gate (R3) treats <em>every</em> Lucid tool as a write by default. A tool's name only belongs in this set after a human has actually read what it does and added it here by hand — the gate fails <strong>closed</strong>, never open, on anything nobody has reviewed.</li>
+</ul>
+<p><strong><code>MCPSession</code></strong> — a <code>@dataclass</code> with two fields, <code>client</code> and <code>tools</code> (the started client, and the list of tools it discovered).</p>
+<ul>
+<li><strong><code>close(self) -&gt; None</code></strong><ul>
+<li><strong>Does:</strong> calls <code>self.client.stop(None, None, None)</code>.</li>
+<li><strong>Why three <code>None</code>s:</strong> <code>MCPClient.stop</code> <em>is</em> the client's context-manager <code>__exit__</code> method, and <code>__exit__</code> always takes three positional arguments — exception type, value, traceback — with no defaults. Calling it directly (instead of through a <code>with</code> block) means you must supply all three yourself, even though nothing failed.</li>
+</ul>
+</li>
+</ul>
+<p><strong><code>_list_all_tools(client) -&gt; list</code></strong> — a private helper (leading underscore), called only from <code>start_lucid</code>.</p>
+<ul>
+<li><strong>Does, step by step:</strong><ol>
+<li>Start with an empty list and <code>token = None</code>.</li>
+<li>Call <code>client.list_tools_sync(pagination_token=token)</code> to get one page.</li>
+<li>Extend the running list with that page's tools.</li>
+<li>Set <code>token = page.pagination_token</code>.</li>
+<li>If <code>token</code> is <code>None</code>, return the accumulated list. Otherwise, go back to step 2.</li>
+</ol>
+</li>
+<li><strong>Why:</strong> <code>list_tools_sync</code> is paginated — one call only returns the first page. A server exposing more tools than fit on one page would otherwise look like it had fewer tools than it does, silently.</li>
+</ul>
+<p><strong><code>start_lucid() -&gt; MCPSession | None</code></strong></p>
+<ul>
+<li><strong>Does, step by step:</strong><ol>
+<li>Import <code>MCPClient</code> from <code>strands.tools.mcp</code> (lazily — this import only matters when Lucid is actually enabled).</li>
+<li>Build <code>headers</code>: <code>{"Authorization": f"Bearer {env.LUCID_MCP_AUTH_TOKEN}"}</code> if that setting is non-empty, else <code>None</code>.</li>
+<li>Construct <code>client = MCPClient(url=env.LUCID_MCP_URL, headers=headers)</code> — this does not start anything yet.</li>
+<li>Inside a <code>try</code>: call <code>client.start()</code> explicitly, then return <code>MCPSession(client=client, tools=_list_all_tools(client))</code>.</li>
+<li>In the matching <code>except Exception</code>: print a warning that names the exception's type and message and says the diagram lane will continue with its local tool only; then, in a nested <code>try</code>/<code>except</code> that swallows any further error, call <code>client.stop(None, None, None)</code> so a half-started background thread doesn't leak; finally return <code>None</code>.</li>
+</ol>
+</li>
+<li><strong>Why fail this soft:</strong> <code>start_lucid()</code> is only called when <code>LUCID_MCP_ENABLED</code> is true (R6's <code>main.py</code> decides that — this file doesn't check the flag itself). Lucid is one optional lane's nice-to-have, not a dependency the whole app needs to boot; an unreachable server, a bad token, or any other failure must degrade to "the diagram lane drafts briefs but can't create diagrams," never crash startup.</li>
+<li><strong>Watch out — pick exactly one owner:</strong> Strands also lets you skip all of this and pass an <em>un-started</em> <code>MCPClient</code> straight into <code>Agent(tools=[client])</code>; the agent will then start and stop it for you. But if you call <code>client.start()</code> yourself here <strong>and</strong> also hand that same client to an <code>Agent</code>, the agent tries to start it a second time and fails with "the client session is currently running." This file picks the app as the one owner — which is why <code>start_lucid()</code> returns <code>session.tools</code> (a plain list of already-discovered <code>MCPAgentTool</code> objects) for the <code>Agent</code> to bind, and <code>session.client</code> is only ever touched by <code>close()</code>.</li>
+<li><strong>Watch out — the auth gap is real, not a bug to fix:</strong> Lucid's default auth is per-user OAuth (Dynamic Client Registration), which would need <code>MCPClient(auth_provider=...)</code>. Only a static bearer token (<code>LUCID_MCP_AUTH_TOKEN</code>) is wired here; that limitation is deliberate and documented, not an oversight to silently work around.</li>
+</ul>
 <p><strong>Your tests must cover:</strong></p>
 <div class="scroll"><table>
 <thead>
@@ -2010,36 +2090,159 @@ what "the framework is a thin layer" means in practice.</p>
 <p><strong>Checkpoint R2:</strong> your tests pass. Break it: move one tool's "this WRITES"
 sentence below <code>Args:</code> and watch <code>test_tool_specs.py</code> fail.</p>
 <h2>R3 — Messages and the approval gate (3–4 h)</h2>
-<ol>
-<li><code>➕ pmagent/messages.py</code> [lesson 4]: <code>blocks</code>, <code>text_of</code>, <code>tool_uses</code>,
-    <code>tool_results</code>, <code>is_tool_result</code>, <code>last_user_text</code> (it <strong>skips</strong>
-    <code>toolResult</code> user messages: in Strands a tool result is a <code>role: "user"</code>
-    message), <code>user_message</code>, <code>assistant_message</code> and <code>result_text</code> (text of a
-    tool result; an image becomes <code>[image: png]</code>).</li>
-<li><code>➕ pmagent/gate.py</code> [lesson 6]:<ul>
-<li><code>TOOL_MODULES</code>: the six modules that define <code>@tool</code>s:
- <code>tools/jira/tools_read.py</code>, <code>tools/jira/tools_write.py</code>,
- <code>confluence_tools.py</code>, <code>finance_tools.py</code>, <code>spreadsheet_tools.py</code> and
- <code>diagram_tools.py</code> (the two Jira submodules, not the package; <code>mcp_tools</code>
- defines no tool, and its reviewed reads arrive through
- <code>APPROVED_READ_TOOLS</code>).</li>
-<li>An explicit <code>WRITE_TOOL_NAMES</code> (every write tool's name, listed by hand, so
- adding a write is a deliberate two-place change); <code>READ_TOOL_NAMES</code> derived
- from each module's <code>READ_TOOLS</code> plus <code>mcp_tools.APPROVED_READ_TOOLS</code>;
- <code>REJECTION_MESSAGE</code>; <code>APPROVE = "approve"</code> and <code>REJECT = "reject"</code>.</li>
-<li><code>requires_approval(name, agent)</code>: a name the agent doesn't have → <code>False</code>
- (it can't run anyway); a write → <code>True</code>; anything not declared a read →
- <code>True</code> (fail closed). Check "has" the way the executor does, with
- <code>agent.tool_registry.registry</code> and <code>.dynamic_tools</code>: <code>agent.tool_names</code>
- leaves out a tool whose spec failed validation but which would still run.</li>
-<li><code>ApprovalGate(HookProvider)</code> on <code>BeforeToolsEvent</code>: collect the gated calls
- of the batch; if any, <code>answer = event.interrupt("approval", reason={"calls":
- [{"id": &lt;toolUseId&gt;, "name": …, "args": &lt;input&gt;}, …]})</code> listing only the gated
- ones; if the answer isn't <code>APPROVE</code>, set <code>event.cancel = REJECTION_MESSAGE</code>.
- The CLI and the web API read those three keys.</li>
+<h4><code>➕ pmagent/messages.py</code> [lesson 4] — small readers over the Bedrock Converse message shape</h4>
+<p>A Strands conversation is a list of dicts: <code>{"role": ..., "content": [blocks]}</code>. This
+module never builds or mutates that list — it only reads it, so every other module
+that needs to ask "what did the human say?" or "what did this tool return?" goes
+through here instead of poking at <code>content</code> blocks directly.</p>
+<p><strong><code>blocks(message) -&gt; list[dict]</code></strong></p>
+<ul>
+<li><strong>Does:</strong> returns <code>message["content"]</code>, or <code>[]</code> if the key is missing/<code>None</code>.</li>
+</ul>
+<p><strong><code>text_of(message) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> joins every block's <code>"text"</code> value with a space, then strips the result.</li>
+<li><strong>Watch out:</strong> a tool call, a tool result and an image block have no <code>"text"</code> key
+    and are silently skipped — this only ever returns prose.</li>
+</ul>
+<p><strong><code>tool_uses(message) -&gt; list[dict]</code></strong> / <strong><code>tool_results(message) -&gt; list[dict]</code></strong></p>
+<ul>
+<li><strong>Does:</strong> each returns the <code>"toolUse"</code> (or <code>"toolResult"</code>) value of every block
+    that has one, in order.</li>
+</ul>
+<p><strong><code>is_tool_result(message) -&gt; bool</code></strong></p>
+<ul>
+<li><strong>Does:</strong> <code>True</code> when the message's role is <code>"user"</code> <strong>and</strong> <code>tool_results(message)</code>
+    is non-empty.</li>
+<li><strong>Why:</strong> in Strands, a tool result is delivered as a <code>role: "user"</code> message, not a
+    separate role. Without this check, "the last user message" would sometimes mean
+    "what a tool returned," not "what the human typed."</li>
+</ul>
+<p><strong><code>last_user_text(messages) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> walks <code>messages</code> from the end backwards; returns the first message that
+    is role <code>"user"</code> <strong>and not</strong> a tool result (via <code>is_tool_result</code>), then its
+    <code>text_of(...)</code>; <code>""</code> if nothing matches or the text is empty.</li>
+<li><strong>Watch out:</strong> this is the one function in the whole codebase that answers "what
+    did the human actually ask for" — the router (R4) depends on it not being fooled
+    by tool output.</li>
+</ul>
+<p><strong><code>user_message(text) -&gt; dict</code></strong> / <strong><code>assistant_message(text) -&gt; dict</code></strong></p>
+<ul>
+<li><strong>Does:</strong> build <code>{"role": "user"|"assistant", "content": [{"text": text}]}</code>.
+    Trivial constructors — write them last if it helps, but other steps import
+    them by these exact names.</li>
+</ul>
+<p><strong><code>result_text(result) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> takes a <code>toolResult</code> dict, walks its <code>content</code> blocks, and joins one
+    line per block: a <code>"text"</code> block as-is; a <code>"json"</code> block as <code>str(...)</code>; a
+    <code>"document"</code> block as the literal string <code>[document]</code>; an <code>"image"</code> block as
+    <code>[image: &lt;format&gt;]</code> (e.g. <code>[image: png]</code>) — read the format from
+    <code>block["image"]["format"]</code>, default to <code>"?"</code> if it's missing.</li>
+<li><strong>Why:</strong> this is what the CLI and web UI show for a tool's output. An image
+    can't be printed to a terminal, so it gets a label instead of being dropped
+    silently.</li>
+</ul>
+<h4><code>➕ pmagent/gate.py</code> [lesson 6] — the approval gate: nothing that writes runs until a human says yes</h4>
+<p>This file has two jobs: (1) decide, for any tool name, whether a human must approve
+it before it runs, and (2) a hook that actually pauses the agent when the model
+asks for a gated call.</p>
+<p><strong>Constants, built once at import time:</strong></p>
+<ul>
+<li><code>TOOL_MODULES</code>: a tuple of the <strong>six</strong> modules that define <code>@tool</code>s —
+    <code>tools/jira/tools_read.py</code>, <code>tools/jira/tools_write.py</code>,
+    <code>tools/confluence_tools.py</code>, <code>tools/finance_tools.py</code>,
+    <code>tools/spreadsheet_tools.py</code>, <code>tools/diagram_tools.py</code>. Import the two Jira
+    submodules directly (not the <code>jira</code> package). Leave <code>mcp_tools</code> out — it
+    defines no <code>@tool</code> itself; its reviewed tools are handled separately (below).</li>
+<li><code>WRITE_TOOL_NAMES</code>: a hand-written <code>frozenset[str]</code> of every tool name that
+    changes something outside this process — every Jira write, the spreadsheet
+    writes, and <code>create_fy_budget_csv</code>.<ul>
+<li><strong>Why hand-written, not derived:</strong> if it were computed from each module's
+<code>WRITE_TOOLS</code> list, adding a write tool would be a one-place change. Writing
+it out by hand makes it a <strong>deliberate two-place</strong> change (declare the tool,
+then separately name it here) that a test can reconcile — one accidental typo
+in either place fails a test instead of silently under-gating a write.</li>
+<li><strong>Watch out:</strong> <code>create_fy_budget_csv</code> belongs here even though it "just"
+writes a local file — that CSV is real financial data that gets ingested
+into Snowflake, so writing it is not a harmless preview.</li>
 </ul>
 </li>
+<li><code>READ_TOOL_NAMES</code>: a <code>frozenset[str]</code> built by union: every tool name in every
+    <code>TOOL_MODULES</code> member's <code>READ_TOOLS</code> list, plus every name in
+    <code>mcp_tools.APPROVED_READ_TOOLS</code>.</li>
+<li><code>REJECTION_MESSAGE</code>: the fixed string the model sees after a human rejects a
+    call — it should explain nothing was written and invite the model to ask what
+    the human wants instead (exact wording is yours).</li>
+<li><code>INTERRUPT_NAME = "approval"</code>, <code>APPROVE = "approve"</code>, <code>REJECT = "reject"</code>: the
+    interrupt's name and the two answer strings. The CLI and the web API send
+    <code>APPROVE</code>/<code>REJECT</code> back verbatim, so keep these as plain constants other code
+    can import rather than inlining the strings elsewhere.</li>
+</ul>
+<p><strong><code>requires_approval(name, agent) -&gt; bool</code></strong></p>
+<ul>
+<li><strong>Does, in order:</strong><ol>
+<li>If <code>agent</code> would not actually run a tool called <code>name</code> (see "has a tool"
+ below), return <code>False</code>.</li>
+<li>If <code>name</code> is in <code>WRITE_TOOL_NAMES</code>, return <code>True</code>.</li>
+<li>Otherwise return <code>True</code> unless <code>name</code> is in <code>READ_TOOL_NAMES</code> — i.e. gate
+ everything <strong>except</strong> a declared read.</li>
 </ol>
+</li>
+<li><strong>Why step 1:</strong> a call the agent can't run at all shouldn't pause for a human's
+    approval — that would ask them to approve something that will fail regardless.
+    This happens in practice: every lane shares one message history, so a read-only
+    lane can "remember" a write tool it saw a different lane use earlier in the same
+    conversation, without ever having that tool bound to it.</li>
+<li><strong>Why step 3 is phrased as "gate unless proven safe," not "gate if known
+    unsafe":</strong> this is the fail-closed rule. A tool discovered at runtime (an MCP
+    server's tools, lesson 8) can't appear in any module's <code>READ_TOOLS</code>, so with this
+    phrasing it is gated by default until a human reviews it and adds its name to
+    <code>mcp_tools.APPROVED_READ_TOOLS</code>. Phrasing it the other way around — "gate only
+    tools in a known-write list" — is exactly the bug this port is fixing: an
+    unreviewed tool would run un-gated.</li>
+<li><strong>"Has a tool," precisely:</strong> don't use <code>agent.tool_names</code> for this check. It
+    omits a tool whose spec failed validation but that the agent's executor would
+    still attempt to run — so checking <code>tool_names</code> could let an unapproved write
+    slip through ungated. Check the same two places the executor itself consults
+    before running a tool (Strands' <code>Agent.tool_registry</code>: its <code>dynamic_tools</code> dict
+    and its <code>registry</code> dict). A name in either one counts as "has."</li>
+</ul>
+<p><strong><code>ApprovalGate</code> — a <code>HookProvider</code>, registered on every lane agent by
+<code>pmagent/agents/common.py::make_lane_agent</code> (R4)</strong></p>
+<ul>
+<li><strong>Does:</strong> registers one callback on <code>BeforeToolsEvent</code> — the event that fires
+    after the model has asked for a batch of tool calls, before any of them run.
+    The callback:<ol>
+<li>Reads every <code>toolUse</code> block off the event's message.</li>
+<li>Filters to the ones where <code>requires_approval(call_name, event.agent)</code> is
+ <code>True</code>. If none, return immediately — a pure-read batch never interrupts.</li>
+<li>Otherwise builds <code>reason = {"calls": [{"id": &lt;toolUseId&gt;, "name": ...,
+ "args": &lt;input&gt;}, ...]}</code>, listing <strong>only</strong> the gated calls (not the whole
+ batch — a read bundled with a write is still fully paused, but the human is
+ only shown the part that needs a decision).</li>
+<li>Calls <code>answer = event.interrupt(INTERRUPT_NAME, reason=reason)</code>.</li>
+<li>If <code>answer != APPROVE</code>, sets <code>event.cancel = REJECTION_MESSAGE</code>.</li>
+</ol>
+</li>
+<li><strong>Why the two-phase call matters:</strong> <code>event.interrupt(...)</code> <em>raises</em> the first
+    time it's called — Strands catches that, stops the agent loop, and returns an
+    <code>AgentResult</code> with <code>stop_reason == "interrupt"</code>. Whoever is driving the agent
+    (<code>PMAssistant</code>, R5) shows <code>reason</code> to a human, then resumes the same agent with
+    an <code>interruptResponse</code> block carrying the human's answer. Strands re-fires
+    <code>BeforeToolsEvent</code> for the <em>same</em> batch, and this time <code>event.interrupt(...)</code>
+    <strong>returns</strong> the answer instead of raising. Your hook code doesn't need an
+    if/else for "first call vs. resumed call" — that's handled for you by
+    <code>interrupt</code> raising once and returning once.</li>
+<li><strong>Why <code>event.cancel</code>, not just returning:</strong> setting <code>event.cancel</code> to a string
+    cancels the <em>whole</em> batch — every gated tool call in it gets an error result
+    equal to that string, and the model is invoked again so it can react to the
+    refusal in its next reply. A no-op return would leave the batch to actually run.</li>
+<li><strong>Watch out:</strong> the exact shape of <code>reason</code> (<code>{"calls": [{"id", "name", "args"},
+    ...]}</code>) is a contract — the CLI's and the web API's approval-rendering code (R6,
+    R7) read those three keys by name.</li>
+</ul>
 <p><strong>Your tests (<code>➕ tests/test_messages.py</code>, <code>➕ tests/test_gate.py</code>) must cover:</strong></p>
 <div class="scroll"><table>
 <thead>
@@ -2098,94 +2301,161 @@ sentence below <code>Args:</code> and watch <code>test_tool_specs.py</code> fail
 <p><strong>Checkpoint R3:</strong> your tests pass. Break it: change <code>if not gated: return</code> to
 always return, and count the failures.</p>
 <h2>R4 — Lanes, router and the PRD workflow (4–5 h)</h2>
-<ol>
-<li><code>➕ pmagent/agents/common.py</code>: <code>make_lane_agent(name, system_prompt, tools, *,
-    model=None, hooks=(), messages=None)</code> returns <code>Agent(model=model or
-    get_model(), name=…, system_prompt=…, tools=…, hooks=[ApprovalGate(), *hooks],
-    conversation_manager=NullConversationManager(), callback_handler=None,
-    messages=messages or [])</code>. The gate is not optional. <code>NullConversationManager</code>
-    keeps the whole history, because a batch is checked against keys the user typed
-    at the start (lesson 4). (R7 adds a <code>callback_handler</code> parameter.)</li>
-<li><strong>The lane declarations.</strong> Each lane module is two constants, <code>SYSTEM_PROMPT</code>
-    and <code>TOOLS</code>; <code>make_lane_agent</code> does the rest. <strong>Bind exactly the tools the
-    lane's prompt names</strong>, and your R6 tests check it both ways:<ul>
-<li><code>➕ pmagent/agents/query_agent.py</code>: the read-only lane: <code>query_jira_issues</code>,
- <code>read_jira_issue_details</code>, <code>read_jira_issues_by_key</code>, <code>list_jira_transitions</code>,
- <code>inspect_fy_budget_inputs</code>, <code>read_fy_budget_run</code>, <code>read_confluence_page</code> and
- <code>search_confluence</code>, with the orchestrator prompt.</li>
-<li><code>➕ pmagent/agents/ticket_agent.py</code>: <code>query_jira_issues</code>,
- <code>read_jira_issue_details</code>, <code>read_jira_issues_by_key</code>, <code>find_jira_user</code>,
- <code>list_jira_transitions</code>, both Confluence tools, <code>validate_ticket_drafts</code>, and
- every Jira write except <code>create_jira_issue</code>; the ticket prompt with the
- <code>ticket</code> skill injected.</li>
-<li><code>➕ pmagent/agents/sprint_agent.py</code>: both sprint-status tools,
- <code>query_jira_issues</code>, <code>read_jira_issue_details</code>, <code>read_jira_issues_by_key</code>,
- <code>list_jira_transitions</code>, <code>add_jira_comment</code>, <code>transition_jira_issues</code> and the
- two sprint moves (scope changes happen in sprint conversations).</li>
-<li><code>➕ pmagent/agents/finance_agent.py</code>: the three finance tools, with the
- <code>fy_budget</code> skill injected. <code>➕ pmagent/agents/spreadsheet_agent.py</code>: the three
- spreadsheet tools.</li>
+<h4><code>➕ pmagent/agents/common.py</code> [lesson 1, lesson 5] — the one function that turns a <code>(prompt, tools)</code> pair into a real Strands <code>Agent</code></h4>
+<p><strong><code>make_lane_agent(name, system_prompt, tools, *, model=None, hooks=(), messages=None) -&gt; Agent</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Build and return <code>Agent(model=model or get_model(), name=name, system_prompt=system_prompt, tools=tools, hooks=[ApprovalGate(), *hooks], conversation_manager=NullConversationManager(), callback_handler=None, messages=messages or [])</code>.</li>
+</ol>
+</li>
+<li><strong>Why:</strong><ul>
+<li><code>ApprovalGate()</code> is always the <em>first</em> hook, and there is no parameter to leave it out — every lane must be gated, and putting the gate here instead of in each lane module makes that structural, not a rule someone has to remember.</li>
+<li><code>NullConversationManager()</code> keeps the whole conversation instead of Strands' default sliding window. A ticket batch gets checked against the list of issue keys the user typed at the start of the conversation; a sliding window could silently drop that message once the conversation grows, and the check would then compare drafts against nothing.</li>
+<li><code>callback_handler=None</code> because printing is the CLI's job (<code>ConsoleEcho</code>, lesson 5), not the agent's. R7 adds a <code>callback_handler</code> parameter here so the web server can pass its own streaming handler instead.</li>
 </ul>
 </li>
-<li>
-<p><code>➕ pmagent/agents/router.py</code> [lesson 7]:</p>
-<ul>
-<li><code>is_continuation(text)</code>: true only when the message is at most 60 characters
- and <strong>every</strong> word (regex <code>[a-z']+</code> on the lowercased text) is in the
- continuation vocabulary. It is a whole-message test: "yes, and also draft a
- ticket for FX" brings new work and must be classified. The vocabulary:</li>
+<li><strong>Watch out:</strong> every one of the six lane-building functions below must call this — a lane built by hand with a bare <code>Agent(...)</code> has no gate.</li>
 </ul>
-<p><code>text
- y ye yes yep yeah yup ya ok okay k sure fine
- confirm confirmed confirming confirmation approve approved approval
- create creation created make it them these those all both
- do go ahead proceed continue send ship submit push
- please thanks thank you now lgtm looks good correct right agreed exactly
- n no nope nah cancel stop dont abort reject rejected hold wait</code>
-- <code>recent_context(messages)</code> renders the last 6 messages: <code>User: …</code>,
- <code>Assistant: …</code>, a tool-only assistant turn as <code>Assistant: (called tools: a,
- b)</code>, and a tool result as <code>Tool result: …</code>, <strong>never</strong> <code>User:</code>.
-- <code>classify(messages, previous_route="", model=None)</code>: if there is a previous
- route and the latest human text is a continuation, return the previous route
- with no model call. Otherwise <code>structured(RouteDecision, prompt)</code>, where the
- prompt holds the task, then (when there is one) "The previous turn was handled
- by the '<route>' route. Stay on it unless this request has genuinely moved
- on", then the recent context, then the latest request.
-- <code>ROUTE_TO_LANE</code>: <code>ticket → ticket_agent</code>, <code>sprint → sprint_agent</code>,
- <code>spreadsheet → spreadsheet_agent</code>, <code>finance → finance_agent</code>,
- <code>diagram → diagram_agent</code>, <code>query → query_agent</code>, <code>requirements →
- requirements</code> (a workflow, not an agent). <code>route_to_lane(route)</code> falls back to
- <code>query_agent</code>.
-4. <code>➕ pmagent/agents/requirements.py</code> [lesson 7]:
-- <code>RequirementsState</code> (<code>source_notes</code>, <code>company_context</code>, <code>prd</code>, <code>review</code>,
- <code>iterations</code>, <code>max_iterations=3</code>, <code>markdown</code>) and
- <code>route_after_review(state)</code>: <code>"render"</code> when approved or the iteration cap is
- reached, else <code>"revise"</code>.
-- <code>write(state, model=None)</code> and <code>review(state, model=None)</code>: two
- <code>structured</code> calls that return the updated state. The writer's system prompt
- and the reviewer's are their <code>.md</code> files with the <code>prd</code> skill (<code>SKILL.md</code>)
- injected. The writer's input is the notes, the company context
- (<code>retrieve_company_context(notes[:200])</code>, from D7), and on a revision the
- previous draft plus the reviewer's missing items and notes; the reviewer's is
- the notes and the draft.
-- <code>render_prd_markdown(prd)</code>: the Atlassian template, in plain Python: <code># title</code>,
- a two-column table of target release, owner and stakeholders, then Objective,
- Background, Success metrics (a Goal/Metric table), Assumptions, Requirements
- (a numbered table: #, user story, importance, Jira, notes), User interaction
- and design, Open questions (a table when there are some) and Out of scope.
- Empty parts read <code>—</code> or <code>_None…_</code>, never a broken table; <code>|</code> and newlines in
- a cell are escaped. <code>render_prd_markdown(None)</code> returns <code>""</code>.
-- <code>run_requirements_loop(state, model=None)</code> loops write → review until
- <code>route_after_review</code> says render, then renders the Markdown.
- <code>run_requirements(notes, model=None)</code> wraps it and returns
- <code>RequirementsResult(reply, prd, review, iterations)</code>; when the cap ends the
- loop, the reply says so. Test the cap through <code>RequirementsState(max_iterations=…)</code>.
-5. <code>➕ pmagent/agents/diagram_agent.py</code>: <code>LOCAL_TOOLS = [draft_diagram_brief]</code>,
-<code>build_tools(mcp_tools)</code> (local plus discovered), and
-<code>system_prompt(lucid_connected)</code>, which without Lucid appends a note containing
-<code>Lucid is **not connected**</code> and says the lane can only draft a brief.</p>
+<h4>The five lane declarations [lesson 2, lesson 7]</h4>
+<p>Every lane module is exactly two module-level constants: <code>SYSTEM_PROMPT</code> (a string) and <code>TOOLS</code> (a list of <code>@tool</code>-decorated functions). <code>make_lane_agent</code> does everything else. There is no per-lane logic to write here — the whole exercise is picking the right tool list and prompt.</p>
+<p><strong>The rule that matters:</strong> bind <em>exactly</em> the tools the lane's system prompt talks about — no more, no fewer. A tool bound but never mentioned in the prompt won't get used reliably; a capability mentioned in the prompt but not bound makes the model claim it can do something it can't. R6's tests check both directions (every named tool is bound, and vice versa), so get this list right now.</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Lane file</th>
+<th>Tools bound</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>➕ pmagent/agents/query_agent.py</code></td>
+<td><code>query_jira_issues</code>, <code>read_jira_issue_details</code>, <code>read_jira_issues_by_key</code>, <code>list_jira_transitions</code>, <code>inspect_fy_budget_inputs</code>, <code>read_fy_budget_run</code>, <code>read_confluence_page</code>, <code>search_confluence</code></td>
+<td>The read-only catch-all: anything the router can't place lands here. Every read-only tool in the whole app belongs on this list too, not just the obvious "search" ones — a read withheld from this lane looks to the user exactly like a missing feature. Only writes are ever withheld.</td>
+</tr>
+<tr>
+<td><code>➕ pmagent/agents/ticket_agent.py</code></td>
+<td><code>query_jira_issues</code>, <code>read_jira_issue_details</code>, <code>read_jira_issues_by_key</code>, <code>find_jira_user</code>, <code>list_jira_transitions</code>, <code>search_confluence</code>, <code>read_confluence_page</code>, <code>validate_ticket_drafts</code>, <code>create_jira_issues</code>, <code>assign_jira_issue</code>, <code>update_jira_issue</code>, <code>add_jira_comment</code>, <code>transition_jira_issues</code>, <code>move_jira_issues_to_sprint</code>, <code>remove_jira_issues_from_sprint</code></td>
+<td>Every Jira write except <code>create_jira_issue</code> (the single-issue form — this lane only uses the batch <code>create_jira_issues</code>). <code>SYSTEM_PROMPT</code> is built with the <code>ticket</code> skill injected (see D2/lesson 2 for skill injection), so the drafting standard lives in Markdown, not in this file.</td>
+</tr>
+<tr>
+<td><code>➕ pmagent/agents/sprint_agent.py</code></td>
+<td><code>get_sprint_status_by_number</code>, <code>get_sprint_status</code>, <code>query_jira_issues</code>, <code>read_jira_issue_details</code>, <code>read_jira_issues_by_key</code>, <code>list_jira_transitions</code>, <code>add_jira_comment</code>, <code>transition_jira_issues</code>, <code>move_jira_issues_to_sprint</code>, <code>remove_jira_issues_from_sprint</code></td>
+<td>The prompt tells the model to reach for <code>get_sprint_status_by_number</code> — users say "sprint 31", never the internal Jira sprint id. The two sprint-membership tools live here (not only in the ticket lane) because scope changes ("move these into 31") come up naturally inside a sprint conversation.</td>
+</tr>
+<tr>
+<td><code>➕ pmagent/agents/finance_agent.py</code></td>
+<td><code>inspect_fy_budget_inputs</code>, <code>create_fy_budget_csv</code>, <code>read_fy_budget_run</code></td>
+<td>The <code>fy_budget</code> skill is injected into <code>SYSTEM_PROMPT</code>. All the arithmetic lives in the FY budget tools themselves (D-chapter); the model's job is picking inputs and reading the validation verdict back honestly, never computing anything itself.</td>
+</tr>
+<tr>
+<td><code>➕ pmagent/agents/spreadsheet_agent.py</code></td>
+<td><code>prepare_spreadsheet_approval_queue</code>, <code>propose_spreadsheet_cell_update</code>, <code>apply_approved_spreadsheet_updates</code></td>
+<td>No skill injection — the prompt alone is enough here.</td>
+</tr>
+</tbody>
+</table></div>
+<h4><code>➕ pmagent/agents/router.py</code> [lesson 3, lesson 4, lesson 7] — decides which lane handles the current turn</h4>
+<p><strong><code>is_continuation(text: str) -&gt; bool</code></strong></p>
+<ul>
+<li>
+<p><strong>Does:</strong></p>
+<ol>
+<li>Strip the text; if it's empty or longer than 60 characters, return <code>False</code>.</li>
+<li>Lower-case it and extract words with the regex <code>[a-z']+</code>.</li>
+<li>If there are no words, return <code>False</code>.</li>
+<li>
+<p>Return <code>True</code> only if <em>every</em> extracted word is in the fixed continuation vocabulary below.</p>
+<p>y ye yes yep yeah yup ya ok okay k sure fine
+confirm confirmed confirming confirmation approve approved approval
+create creation created make it them these those all both
+do go ahead proceed continue send ship submit push
+please thanks thank you now lgtm looks good correct right agreed exactly
+n no nope nah cancel stop dont abort reject rejected hold wait</p>
 </li>
 </ol>
+</li>
+<li>
+<p><strong>Why:</strong> a bare confirmation like "yes, create them" has no topic of its own — classified alone, it can be routed to the wrong lane. This lets a confirmation skip the classifier entirely and just stay on the previous lane.</p>
+</li>
+<li><strong>Watch out:</strong> this must be a <em>whole-message</em> test, not a prefix test. "yes, and also draft a ticket for FX" has to be classified fresh, because it introduces new work — if you check only a prefix, that sentence would wrongly be treated as a pure confirmation. Anything this function doesn't recognise (a typo, an unanticipated phrasing) is meant to fall through to the classifier below, not be guessed at — that's why the check is conservative (all words, not most).</li>
+</ul>
+<p><strong><code>recent_context(messages: list[dict]) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Take the last 6 entries of <code>messages</code>.</li>
+<li>For each one: if it's a tool-result message, render it as <code>Tool result: &lt;the result text&gt;</code>.</li>
+<li>Otherwise, render <code>User: &lt;text&gt;</code> or <code>Assistant: &lt;text&gt;</code>; if an assistant message has no text (it only called tools), render <code>Assistant: (called tools: a, b)</code> listing the tool names.</li>
+<li>Join the non-empty lines with newlines.</li>
+</ol>
+</li>
+<li><strong>Why:</strong> a tool result is a <code>role: "user"</code> message in Strands (lesson 4) — labelling it <code>Tool result:</code> instead of <code>User:</code> stops the classifier from treating tool output as something the human typed.</li>
+</ul>
+<p><strong><code>classify(messages: list[dict], previous_route: str = "", model: Model | None = None) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Get the human's latest text with <code>last_user_text(messages)</code>.</li>
+<li>If there is a <code>previous_route</code> and that text passes <code>is_continuation</code>, return <code>previous_route</code> immediately — no model call.</li>
+<li>Otherwise call <code>structured(RouteDecision, prompt, model=model)</code>, where <code>prompt</code> is: the classification instruction, then (only if there is a previous route) a sentence saying the previous turn was handled by that route and to stay on it unless the request has genuinely moved on, then <code>recent_context(messages)</code>, then the latest request text.</li>
+<li>Return <code>decision.route</code>.</li>
+</ol>
+</li>
+<li><strong>Why:</strong> classifying every message independently, with no memory of the previous route, is what caused a confirmed batch of ticket drafts to be misrouted to the read-only query lane in the original. Passing the previous route as a hint (not a hard override) lets the classifier still switch lanes when the topic actually changes.</li>
+</ul>
+<p><strong><code>ROUTE_TO_LANE</code> and <code>route_to_lane(route: str) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> <code>ROUTE_TO_LANE</code> is a fixed dict mapping every <code>RouteDecision.route</code> literal to a lane name: <code>ticket → ticket_agent</code>, <code>sprint → sprint_agent</code>, <code>spreadsheet → spreadsheet_agent</code>, <code>finance → finance_agent</code>, <code>diagram → diagram_agent</code>, <code>query → query_agent</code>, <code>requirements → requirements</code> (this one names a workflow, not an <code>Agent</code> — see below). <code>route_to_lane</code> looks the route up and falls back to <code>"query_agent"</code> for anything unmapped.</li>
+<li><strong>Watch out:</strong> every route your <code>RouteDecision</code> schema can produce must have an entry here — a route with no lane raises <code>KeyError</code> mid-conversation, which is worse than the safe fallback <code>route_to_lane</code> already provides for genuinely unknown values.</li>
+</ul>
+<h4><code>➕ pmagent/agents/requirements.py</code> [lesson 3, lesson 7] — the PRD writer ↔ reviewer loop</h4>
+<p>This is not a Strands <code>Agent</code>. It's a plain Python state machine that makes two stateless <code>structured()</code> calls (lesson 3) per pass. It's still an <em>agent</em> in the design sense: the reviewer's judgment at runtime decides whether the writer runs again, and how many passes happen.</p>
+<p><strong><code>RequirementsState</code></strong> — a Pydantic model holding <code>source_notes</code>, <code>company_context</code>, <code>prd: PRD | None</code>, <code>review: ReviewResult | None</code>, <code>iterations: int = 0</code>, <code>max_iterations: int = 3</code>, <code>markdown: str</code>.</p>
+<p><strong><code>route_after_review(state) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> return <code>"render"</code> if <code>state.review.approved</code> is <code>True</code>, or if <code>state.iterations &gt;= state.max_iterations</code>; otherwise return <code>"writer"</code>.</li>
+<li><strong>Why:</strong> the iteration cap is a safety net, not the normal exit path — most loops end because the reviewer approved, not because they ran out of passes.</li>
+</ul>
+<p><strong><code>write(state, model=None) -&gt; RequirementsState</code></strong></p>
+<ul>
+<li><strong>Does:</strong> call <code>structured(PRD, prompt, system_prompt=&lt;writer prompt&gt;, model=model)</code> and return <code>state</code> updated with the new <code>prd</code> and <code>iterations + 1</code>.</li>
+<li><strong>Behavior of the prompt it builds:</strong> the source notes, the company context (<code>retrieve_company_context(notes[:200])</code>, from D7), and — only on a revision pass (i.e. <code>state.prd</code> and <code>state.review</code> are both already set) — the previous draft plus the reviewer's <code>missing_requirements</code> and <code>issues</code>.</li>
+<li><strong>Why:</strong> the writer's system prompt is its own <code>.md</code> file with the <code>prd</code> skill injected (same pattern as the ticket lane) — the standard lives in Markdown, editable without touching this code.</li>
+</ul>
+<p><strong><code>review(state, model=None) -&gt; RequirementsState</code></strong></p>
+<ul>
+<li><strong>Does:</strong> call <code>structured(ReviewResult, prompt, system_prompt=&lt;reviewer prompt&gt;, model=model)</code> and return <code>state</code> updated with the new <code>review</code>. The prompt is just the source notes and the current draft.</li>
+</ul>
+<p><strong><code>render_prd_markdown(prd: PRD | None) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> deterministic (no LLM) rendering into the Atlassian PRD template, in this order: <code># &lt;title&gt;</code>, a two-column table of target release / owner / stakeholders, <code>## Objective</code>, <code>## Background</code>, <code>## Success metrics</code> (a Goal/Metric table), <code>## Assumptions</code> (bullets), <code>## Requirements</code> (a numbered table: #, user story, importance, Jira, notes), <code>## User interaction and design</code>, <code>## Open questions</code> (a table, only when there are any), <code>## Out of scope</code> (bullets).</li>
+<li><strong>Watch out:</strong><ul>
+<li>Empty sections must still render something sane — <code>—</code> for a missing one-line field, <code>_None defined._</code> / <code>_None captured._</code> / <code>_Not specified._</code> for an empty list-backed section — never an empty or broken Markdown table.</li>
+<li>Every cell value must be escaped: a literal <code>|</code> or newline inside a cell would otherwise break the table.</li>
+<li><code>render_prd_markdown(None)</code> returns <code>""</code> (called before the first pass has produced anything).</li>
+</ul>
+</li>
+</ul>
+<p><strong><code>run_requirements_loop(state, model=None) -&gt; RequirementsState</code></strong></p>
+<ul>
+<li><strong>Does:</strong> loop <code>write</code> → <code>review</code> → check <code>route_after_review</code>; when it says <code>"render"</code>, set <code>state.markdown = render_prd_markdown(state.prd)</code> and return.</li>
+</ul>
+<p><strong><code>run_requirements(notes: str, model=None) -&gt; RequirementsResult</code></strong></p>
+<ul>
+<li><strong>Does:</strong> build an initial <code>RequirementsState(source_notes=notes, ...)</code>, run it through <code>run_requirements_loop</code>, and wrap the result as <code>RequirementsResult(reply, prd, review, iterations)</code>. If the loop ended on the iteration cap rather than approval, append a note to <code>reply</code> saying the reviewer still had open items.</li>
+<li><strong>Watch out:</strong> test the cap by constructing <code>RequirementsState(max_iterations=&lt;small number&gt;)</code> directly and driving the loop — you shouldn't need a scripted model with dozens of turns to exercise it.</li>
+</ul>
+<h4><code>➕ pmagent/agents/diagram_agent.py</code> [lesson 8] — the one lane whose toolset isn't a fixed list</h4>
+<p><strong><code>LOCAL_TOOLS</code></strong> — always <code>[draft_diagram_brief]</code>.</p>
+<p><strong><code>build_tools(mcp_tools: list | None = None) -&gt; list</code></strong></p>
+<ul>
+<li><strong>Does:</strong> return <code>[*LOCAL_TOOLS, *(mcp_tools or [])]</code>.</li>
+<li><strong>Why:</strong> unlike the other four lanes, this one's tool list depends on whether an MCP session (Lucid) was reachable at startup — see <code>pmagent/tools/mcp_tools.py</code> (R2) for where <code>mcp_tools</code> comes from.</li>
+</ul>
+<p><strong><code>system_prompt(lucid_connected: bool) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> return the lane's base <code>SYSTEM_PROMPT</code> unchanged if <code>lucid_connected</code> is <code>True</code>; otherwise append a note containing the exact phrase <code>Lucid is **not connected**</code> that tells the model it can only draft a brief, not create anything in Lucid.</li>
+<li><strong>Watch out:</strong> the model must never claim it can create a diagram when no Lucid tools are actually bound — that's what this note prevents.</li>
+</ul>
 <p><strong>Your tests (<code>➕ tests/test_router.py</code>, <code>➕ tests/test_requirements.py</code>) must cover:</strong></p>
 <div class="scroll"><table>
 <thead>
@@ -2220,37 +2490,224 @@ always return, and count the failures.</p>
 <p><strong>Checkpoint R4:</strong> your tests pass. Break it: make <code>is_continuation</code> a prefix test,
 and watch the "yes, also…" case fail.</p>
 <h2>R5 — PMAssistant: one conversation, many agents (3–4 h)</h2>
-<p><code>➕ pmagent/assistant.py</code> [lesson 4, lesson 6, lesson 7]:</p>
+<h4><code>➕ pmagent/assistant.py</code> [lesson 4, lesson 6, lesson 7] — the orchestrator: one shared conversation, six lane agents, one interrupt/resume cycle</h4>
+<p>Everything before this step built a piece in isolation (tools, the gate, one lane,
+the router, the requirements loop). This step wires them into the one object the
+CLI and the web server both call. Two ideas from earlier lessons meet here for the
+first time and make each other harder: <strong>all lanes share one message list</strong>
+(lesson 4), and <strong>a write pauses the lane mid-call and must be resumed later</strong>
+(lesson 6). Get the sequencing below exactly right, or a resumed lane either loses
+history or answers the wrong tool call.</p>
+<p><strong><code>TurnResult(route, pending, reply)</code></strong> — a dataclass, and all <code>send</code>/<code>resume</code>
+return.</p>
 <ul>
-<li><code>TurnResult(route, pending, reply)</code> and a module constant <code>ABANDONED_MESSAGE</code>
-    ("Not executed — the approval for this action was abandoned before the user
-    answered. Nothing was written.").</li>
-<li><code>PMAssistant(model=None, *, classify=None, hooks=(), mcp=None, on_route=None)</code>.
-    <code>lanes</code> maps each lane name to <code>(prompt, tools)</code> (the diagram lane's from
-    <code>build_tools(mcp.tools)</code> and <code>system_prompt(bool(mcp and mcp.tools))</code>); lane agents are
-    built lazily with <code>make_lane_agent</code>. <code>classify</code> defaults to the router's;
-    <code>on_route(route)</code> is called before a lane runs.</li>
-<li><code>send(text)</code>: discard any pending approval, classify on
-    <code>self.messages + [user_message(text)]</code> (don't append it yet), announce the
-    route, then either the requirements workflow (the user message and its reply
-    are appended to the shared history, and the reply is returned) or
-    <code>_run_lane(lane, text)</code>.</li>
-<li><code>_run_lane(lane, prompt)</code>: point the lane at <strong>the shared list</strong>
-    (<code>agent.messages = self.messages</code>), call <code>agent(prompt)</code> (Strands appends the
-    user message), and read the list back (in a <code>finally</code>, so it happens even when
-    the call raises). On <code>stop_reason == "interrupt"</code>, remember the lane and its
-    interrupts and return the pending calls.</li>
-<li><code>resume(approved)</code>: <code>_run_lane</code> on the <strong>same</strong> lane with a list of
-    <code>{"interruptResponse": {"interruptId": …, "response": APPROVE or REJECT}}</code>
-    blocks as the prompt. Resuming with nothing pending is an error.</li>
-<li><code>discard_pending()</code>: close any unanswered tool call with a "Not executed"
-    result (every <code>toolUse</code> needs a <code>toolResult</code>, or the provider rejects the
-    history), then drop the paused agent. Its interrupt state is private, so
-    rebuilding the agent is the only way to clear it. Calling it twice is safe.</li>
-<li><code>reset()</code> (a fresh conversation) and <code>close()</code> (closes the MCP session).</li>
-<li>Public state: <code>messages</code>, <code>route</code>, <code>last_prd</code>, and <code>pending</code> (a <code>bool</code>
-    property).</li>
+<li><code>route</code>: the lane the router picked (or kept, on a continuation).</li>
+<li><code>pending</code>: a list of <code>{"id", "name", "args"}</code> dicts — the write calls waiting
+    on approval. Empty means the turn finished with nothing left to approve.</li>
+<li><code>reply</code>: text the <em>caller</em> must print. Only the requirements workflow sets
+    this — a lane agent's own reply is printed live by hooks (<code>cli/echo.py</code>), not
+    returned, because that hook is watching <code>agent.messages</code> as it grows.</li>
 </ul>
+<p><strong>Module constant <code>ABANDONED_MESSAGE</code></strong> — the exact string <code>"Not executed — the
+approval for this action was abandoned before the user answered. Nothing was
+written."</code>. Written into the history in place of a tool result when an approval
+is abandoned (see <code>discard_pending</code> below). Pick your own wording, but every
+lane's tests and the CLI expect that a value exists and is user-readable.</p>
+<p><strong><code>PMAssistant(model=None, *, classify=None, hooks=(), mcp=None, on_route=None)</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Store the constructor arguments as private state (<code>self._model</code>,
+ <code>self._custom_classify</code>, <code>self._hooks</code>, <code>self._mcp</code>, <code>self._on_route</code>).</li>
+<li>Initialise the shared, mutable state every other method reads and writes:
+ <code>self.messages = []</code>, <code>self.route = ""</code>, <code>self.last_prd = None</code>, plus two
+ private fields that track a paused lane: <code>self._pending_lane = None</code> and
+ <code>self._pending_interrupts = []</code>.</li>
+<li>Set up an empty cache for lane agents, <code>self._agents: dict[str, Agent] = {}</code>
+ — agents are built lazily (see <code>send</code>/<code>resume</code> below), not here.</li>
+<li>Build <code>self.lanes: dict[str, tuple[str, list]]</code>, mapping each lane name to
+ its <code>(system_prompt, tools)</code> pair, by importing the six lane modules built
+ in R4 and reading their <code>SYSTEM_PROMPT</code>/<code>TOOLS</code> constants directly — except
+ the diagram lane, whose prompt and tools depend on whether an MCP session
+ was given: <code>diagram_agent.system_prompt(lucid_connected=bool(mcp_tools))</code>
+ and <code>diagram_agent.build_tools(mcp_tools)</code>, where <code>mcp_tools = mcp.tools if
+ mcp else []</code>.</li>
+</ol>
+</li>
+<li><strong>Why:</strong> Lane agents are expensive to build (each one is a Strands <code>Agent</code>
+    with its own hooks and tool bindings) and most conversations never touch most
+    lanes, so building them lazily on first use, not here, avoids paying for six
+    agents when a conversation only ever needs one.</li>
+<li><strong>Watch out:</strong> <code>self.lanes</code> is data (prompt + tool list), not agents. Don't
+    confuse it with <code>self._agents</code>, the lazy cache — R6/R7 code and your tests
+    will refer to both.</li>
+</ul>
+<p><strong>Building (and caching) a lane's agent</strong> — needed by both <code>send</code> and <code>resume</code>
+below, so give it its own small helper, e.g. a private method <code>agent(lane) -&gt;
+Agent</code>.</p>
+<ul>
+<li><strong>Does:</strong> if <code>lane</code> isn't in <code>self._agents</code> yet, look up its
+    <code>(system_prompt, tools)</code> in <code>self.lanes</code>, build it with R4's
+    <code>make_lane_agent(lane, system_prompt, tools, model=self._model,
+    hooks=self._hooks)</code>, and cache it; either way, return the cached agent.</li>
+<li><strong>Why:</strong> the <em>same</em> <code>Agent</code> object must be reused across a pause and its
+    resume, because a Strands agent's interrupt state lives on that object
+    privately — a freshly built agent has no memory of the paused call. Caching
+    by lane name is what makes <code>resume</code> able to find "the same lane" later.</li>
+</ul>
+<p><strong><code>send(text: str) -&gt; TurnResult</code></strong> — call this once per user message.</p>
+<ul>
+<li><strong>Does, in order:</strong><ol>
+<li>If a previous turn is still waiting on an approval (<code>self.pending</code> is
+ <code>True</code>), abandon it first: call <code>self.discard_pending()</code>.</li>
+<li>Classify the route by calling the router on <code>self.messages + [user_message(text)]</code>
+ — a <em>new</em> list built for this call, not appended to <code>self.messages</code> yet.</li>
+<li>Store the result on <code>self.route</code>, and, if <code>on_route</code> was given to the
+ constructor, call <code>on_route(route)</code> — before the lane runs, so a live CLI
+ can print <code>[route: x]</code> ahead of the lane's own output.</li>
+<li>Look up the lane name for that route with <code>router.route_to_lane(route)</code>.</li>
+<li>If the lane is <code>"requirements"</code>, hand off to the requirements workflow
+ (see below) and return its result. Otherwise, run the lane agent (see
+ <code>_run_lane</code> below) and return <em>its</em> result.</li>
+</ol>
+</li>
+<li><strong>Why step 2 doesn't append to <code>self.messages</code> yet:</strong> the classifier must see
+    the new message to decide the route, but nothing should land in the shared
+    history until you know which lane (or workflow) is going to consume it —
+    <code>_run_lane</code> and the requirements workflow each append the user message
+    themselves, in their own way (see below).</li>
+</ul>
+<p><strong><code>_run_lane(lane: str, prompt) -&gt; TurnResult</code></strong> — runs one lane agent for one
+turn, whether starting a new turn or continuing a resumed one. <code>prompt</code> is
+either the user's text (from <code>send</code>) or a list of <code>interruptResponse</code> blocks
+(from <code>resume</code>, see below) — either is valid input to <code>agent(...)</code>.</p>
+<ul>
+<li><strong>Does, in order:</strong><ol>
+<li>Get the lane's agent via the cache helper above.</li>
+<li>Point it at the shared conversation: <code>agent.messages = self.messages</code>.
+ Strands will append to this exact list as the call runs.</li>
+<li>Call <code>agent(prompt)</code> inside a <code>try</code>. In a <code>finally</code> clause — so it runs
+ even if the call raises — read the list back: <code>self.messages =
+ agent.messages</code>.</li>
+<li>If <code>result.stop_reason == "interrupt"</code>: remember which lane is now paused
+ (<code>self._pending_lane = lane</code>) and its interrupts (<code>self._pending_interrupts
+ = list(result.interrupts or [])</code>); collect every gated call out of each
+ interrupt's <code>reason["calls"]</code> into one flat list; return a <code>TurnResult</code>
+ with that list as <code>pending</code>.</li>
+<li>Otherwise the turn finished cleanly: clear <code>self._pending_lane</code> and
+ <code>self._pending_interrupts</code>, and return a <code>TurnResult</code> with <code>pending=[]</code>.</li>
+</ol>
+</li>
+<li><strong>Why the <code>finally</code>:</strong> if <code>agent(prompt)</code> raises partway through (a tool
+    crash, a provider error), Strands may already have appended messages — the
+    assistant's <code>toolUse</code> message, for instance — before the exception surfaces.
+    Reading <code>agent.messages</code> back regardless keeps <code>self.messages</code> in sync with
+    whatever the agent actually did, not just with the calls that returned
+    cleanly. Skip the <code>finally</code> and a crash mid-turn silently drops history.</li>
+<li><strong>Watch out:</strong> step 2 must happen on <em>every</em> call, not just the first —
+    <code>agent.messages</code> is only "the shared list" for as long as you keep
+    re-pointing it there. If another lane ran in between (see the router's
+    continuation logic and <code>send</code>'s dispatch), this lane's own <code>agent.messages</code>
+    attribute is stale until this line runs again.</li>
+</ul>
+<p><strong><code>resume(approved: bool) -&gt; TurnResult</code></strong> — call this exactly once per
+<code>pending</code> <code>TurnResult</code>, after the human has decided.</p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>If nothing is pending (<code>self.pending</code> is <code>False</code>), raise a <code>RuntimeError</code>
+ — there is nothing to resume.</li>
+<li>Build one <code>{"interruptResponse": {"interruptId": interrupt.id, "response":
+ answer}}</code> block per interrupt in <code>self._pending_interrupts</code>, where
+ <code>answer</code> is <code>gate.py</code>'s <code>APPROVE</code> if <code>approved</code> else its <code>REJECT</code>.</li>
+<li>Call <code>_run_lane(self._pending_lane, responses)</code> — the <strong>same</strong> lane name
+ that was paused, so the cached, still-paused <code>Agent</code> object is the one
+ that receives the answer.</li>
+</ol>
+</li>
+<li><strong>Watch out:</strong> <code>resume</code> does <em>not</em> clear <code>self._pending_lane</code> /
+    <code>self._pending_interrupts</code> itself before calling <code>_run_lane</code> — it reads them
+    to build the response blocks, and <code>_run_lane</code>'s own step 4/5 (above) is what
+    updates or clears them afterwards, once it knows whether the resumed call
+    led to <em>another</em> pause (a second write right after an approved one) or
+    finished cleanly. If <code>_run_lane</code> raises, <code>self._pending_lane</code> /
+    <code>self._pending_interrupts</code> are left exactly as they were — the approval is
+    still "pending" from the caller's point of view, and <code>discard_pending()</code> is
+    the only way out. This is deliberate: don't clear pending state before you
+    know the resumed call actually landed.</li>
+</ul>
+<p><strong><code>discard_pending() -&gt; None</code></strong> — abandon whatever is pending, if anything.
+Safe to call when nothing is pending, and safe to call twice in a row.</p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Read and immediately clear <code>self._pending_lane</code> / <code>self._pending_interrupts</code>
+ (set both back to "nothing pending"), keeping only a local copy of the
+ lane name.</li>
+<li>If that local copy is <code>None</code> (nothing was pending), stop here — this is
+ what makes a second call a no-op.</li>
+<li>Otherwise, walk <code>self.messages</code> for the last assistant turn's <code>toolUse</code>
+ blocks that have no matching <code>toolResult</code> yet, and append one <code>role:
+ "user"</code> message with a <code>toolResult</code> (<code>status: "error"</code>, text =
+ <code>ABANDONED_MESSAGE</code>) for each — see the free function below.</li>
+<li>Drop the paused agent from the cache: <code>self._agents.pop(lane, None)</code>. The
+ next <code>send</code>/<code>resume</code> for that lane will build a fresh one.</li>
+</ol>
+</li>
+<li><strong>Why every unanswered <code>toolUse</code> needs an explicit result:</strong> a Strands/
+    Bedrock-shaped conversation is invalid if a <code>toolUse</code> block is ever followed
+    by a new user turn with no matching <code>toolResult</code> (lesson 4) — the next model
+    call would be rejected by the provider. Writing an explicit "not executed"
+    result keeps the history valid without pretending the write happened.
+    Rebuilding the agent (step 4) is necessary on top of that because a Strands
+    agent's interrupt state is private: once an agent is paused, there is no
+    public method that un-pauses it except answering the interrupt it's actually
+    waiting on — so a paused agent that will never be resumed has to be replaced,
+    not reset.</li>
+</ul>
+<p><strong>A free function, <code>_close_unanswered_tool_calls(messages)</code></strong> — the mechanics
+behind <code>discard_pending</code> step 3. Not part of the public class, but easiest to
+test on its own, so give it its own name.</p>
+<ul>
+<li><strong>Does:</strong> finds the last message with <code>role == "assistant"</code>; collects the
+    <code>toolUseId</code> of every <code>toolUse</code> block in it; collects the <code>toolUseId</code> of every
+    <code>toolResult</code> already present in any later message; for every id in the first
+    set but not the second, appends one <code>toolResult</code> block (as described above).
+    If every call already has a result — e.g. a <code>resume</code> that failed <em>after</em> the
+    tools actually ran — this appends nothing.</li>
+<li><strong>Watch out:</strong> it never removes or edits the original <code>toolUse</code> message.
+    Providers reject a <code>toolResult</code> with no matching call just as they reject a
+    call with no result, so the fix is always to add the missing result, never
+    to delete the call.</li>
+</ul>
+<p><strong>The requirements workflow</strong> — <code>send</code> routes here directly; it never goes
+through <code>_run_lane</code>.</p>
+<ul>
+<li><strong>Does:</strong> call R4's <code>run_requirements(text, model=self._model)</code>; store
+    <code>result.prd</code> on <code>self.last_prd</code>; append the turn to the shared history
+    yourself — <code>self.messages.append(user_message(text))</code>, then
+    <code>self.messages.append(assistant_message(result.reply))</code>; return a
+    <code>TurnResult</code> with <code>reply=result.reply</code> (and <code>pending=[]</code>, the default).</li>
+<li><strong>Why it appends messages itself:</strong> the requirements workflow is two
+    <code>structured()</code> calls (lesson 3), not a Strands <code>Agent</code> — there is no
+    <code>agent.messages</code> for it to share, and no hook watching it, so nothing else
+    will put its turn into the shared history or print its reply. That is also
+    why <code>TurnResult.reply</code> exists at all: it is the one path where the caller,
+    not a hook, is responsible for showing the user the answer.</li>
+</ul>
+<p><strong><code>reset() -&gt; None</code></strong> — start a fresh conversation (the CLI's <code>/new</code>).</p>
+<ul>
+<li><strong>Does:</strong> <code>discard_pending()</code> first (never leave a paused agent behind), then
+    clear the agent cache (<code>self._agents.clear()</code>), then reset <code>self.messages</code>,
+    <code>self.route</code> and <code>self.last_prd</code> to their constructor defaults.</li>
+</ul>
+<p><strong><code>close() -&gt; None</code></strong> — release external resources.</p>
+<ul>
+<li><strong>Does:</strong> if an MCP session was given, close it (<code>self._mcp.close()</code>).
+    Nothing else to release.</li>
+</ul>
+<p><strong>Public state, for callers and tests to read directly (no method needed):</strong>
+<code>self.messages</code> (the shared history), <code>self.route</code> (the current lane's route
+name), <code>self.last_prd</code> (the most recent structured PRD, or <code>None</code>), and
+<code>self.pending</code> — a read-only <code>@property</code> that is simply <code>self._pending_lane is
+not None</code>, so callers never have to know the private field's name.</p>
 <p><strong>Your tests (<code>➕ tests/test_assistant.py</code>, with <code>classify=lambda messages,
 previous: "&lt;route&gt;"</code>, a route name such as <code>"ticket"</code>, to skip the router) must
 cover:</strong></p>
@@ -2336,47 +2793,95 @@ cover:</strong></p>
 Break it: remove <code>agent.messages = self.messages</code>, and the sprint → query → sprint
 case should fail.</p>
 <h2>R6 — The CLI (3–4 h)</h2>
-<ol>
-<li><code>➕ pmagent/cli/echo.py</code> [lesson 5]: <code>ConsoleEcho(HookProvider)</code> on
-    <code>MessageAddedEvent</code>. <code>render_message(message) -&gt; list[str]</code> gives assistant text,
-    <code>-&gt; tool(args)</code> for a call, and <code>| …</code> previews of a tool result (at most 600
-    characters, images labelled), and <strong>nothing for the user's own prompt</strong>.</li>
-<li><code>➕ pmagent/cli/approval.py</code>: what the human reads at the approval prompt.
-    The rule is <strong>show what could be wrong, not what is there</strong>: the sprint a
-    ticket lands in, the source issue each draft came from, the full comment text.<ul>
-<li><code>_describe_write(call)</code> has one case per gated tool (every name in
- <code>WRITE_TOOL_NAMES</code>), and a readable fallback for anything else gated.</li>
-<li><code>draft_manifest(drafts)</code> gives one line per draft (index, source issue,
- assignee, summary) when there are more than 3, flagging a draft with no
- source.</li>
-<li><code>unchecked_scope_warning(messages, calls)</code> notes when the user's last message
- named 3 or more issue keys but a create call declared no <code>scope</code>.</li>
-<li><code>describe_write(call)</code> wraps them and <strong>never raises</strong>: a renderer crash
- falls back to the tool name and its arguments.</li>
+<h4><code>➕ pmagent/cli/echo.py</code> [lesson 5] — hook that prints the conversation as it happens</h4>
+<p><strong><code>ConsoleEcho(HookProvider)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> registers <code>on_message</code> on Strands' <code>MessageAddedEvent</code>. Give every lane agent one instance in its <code>hooks=[...]</code> list (after the gate — see R4).</li>
+<li><strong>Why:</strong> the default <code>callback_handler</code> only sees token-level stream chunks. This hook sees whole messages — including tool <em>results</em>, which don't exist at the callback-handler level — which is what a terminal UI needs to print.</li>
 </ul>
-</li>
-<li><code>➕ main.py</code>: the banner, <code>/new</code>, <code>/help</code> and <code>/exit</code>, and a <code>[route: x]</code>
-    printer.<ul>
-<li><code>build_assistant(route_printer)</code> returns a <code>PMAssistant</code> with
- <code>hooks=[ConsoleEcho()]</code>, <code>on_route=route_printer</code> (it prints <code>[route: x]</code> when
- the lane changes) and, when <code>LUCID_MCP_ENABLED</code>, the session from
- <code>start_lucid()</code>. <code>main()</code> first runs <code>env.validate()</code> and <code>validate_jira()</code>,
- and prints <code>Configuration error: …</code> and returns 1 on a <code>ValueError</code>.</li>
-<li><code>handle_turn(assistant, user_input, ask=input) -&gt; bool</code> calls <code>send</code>, prints
- <code>result.reply</code> only for the requirements route (lane replies were already
- printed by <code>ConsoleEcho</code>; the workflow runs outside any agent, so the hook
- never sees it), runs <code>resolve_approvals</code>, and on any error prints it and calls
- <code>discard_pending()</code>; a context overflow tells the user to <code>/new</code>. It returns
- <code>False</code> when the user quit mid-approval.</li>
-<li><code>resolve_approvals(assistant, result, ask=input) -&gt; bool</code> loops
- <code>describe_write</code> → <code>Approve? [y/N]</code> → <code>resume</code>. Only <code>y</code>/<code>yes</code> approves.
- Ctrl-D/Ctrl-C at the prompt calls <code>discard_pending()</code> and returns <code>False</code>.</li>
-<li><code>_quiet_library_logs()</code> sets the library loggers' level from
- <code>PMAGENT_LOG_LEVEL</code> (default <code>CRITICAL</code>). R7's <code>web.py</code> imports it from
- <code>main</code>, so keep the name.</li>
-</ul>
-</li>
+<p><strong><code>render_message(message: dict) -&gt; list[str]</code></strong></p>
+<ul>
+<li><strong>Does:</strong> given one message from <code>agent.messages</code>:<ol>
+<li>If it's an assistant message: one line for its text (if any), then one <code>-&gt; tool_name(args)</code> line per tool call it made, with <code>args</code> rendered compactly by <code>brief</code> (below).</li>
+<li>Otherwise (a <code>role: "user"</code> message — which in Strands is also where tool <em>results</em> live; see lesson 4): one or more <code>| ...</code> preview lines per tool result, each result's text capped at 600 characters, with an image labelled rather than dumped.</li>
+<li>Returns <code>[]</code> for the human's own typed prompt — it's already on the user's screen, so this hook only needs to show what happens <em>after</em> it.</li>
 </ol>
+</li>
+<li><strong>Watch out:</strong> the stateless structured-output agents (router, PRD writer/reviewer, diagram brief) never get this hook, so their hidden tool calls never print — that's intentional (lesson 3). But if you add a <em>new</em> lane agent and forget to give it <code>ConsoleEcho()</code>, the symptom looks the same: silence where you expected <code>-&gt; tool(...)</code> lines.</li>
+</ul>
+<p><strong><code>brief(args: dict) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> JSON-dumps a dict of tool arguments; if the result is longer than 120 characters, cuts it off and appends <code>...}</code>. Used by <code>echo.py</code> for tool-call lines and reused by <code>approval.py</code>'s fallback case.</li>
+</ul>
+<hr />
+<h4><code>➕ pmagent/cli/approval.py</code> — what the human reads before approving a write</h4>
+<p>Design rule, carried over unchanged from the original project: <strong>an approval prompt shows what could be wrong, not what is there.</strong> Every function below exists to answer one question — <em>is this the write I meant?</em> — not to dump the raw call. In practice: show the sprint a ticket is landing in, the source issue each draft claims to derive from, and the full text of any comment (never truncated: approving wording you cannot see is not approval).</p>
+<p><strong><code>_describe_write(call: dict) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> dispatches on <code>call["name"]</code> with one <code>if</code>-branch per name in <code>pmagent/gate.py::WRITE_TOOL_NAMES</code> (R3), each rendering only the fields that distinguish a correct write from a wrong one — e.g. for <code>create_jira_issue(s)</code>, the declared <code>scope</code> (if any), then per draft: issue type, summary, source issue, assignee, story points, sprint, acceptance criteria, in that order, provenance (<code>source_issue</code>) always shown first. A name with no branch falls through to the last case.</li>
+<li><strong>Watch out:</strong> the fallback case is <code>f"{name}({brief(args)})"</code> — raw arguments, no interpretation. It's deliberately unhelpful: if you're reading it, some write tool is missing a case above it.</li>
+</ul>
+<p><strong><code>draft_manifest(drafts: list[dict]) -&gt; list[str]</code></strong></p>
+<ul>
+<li><strong>Does:</strong> returns <code>[]</code> when there are 3 or fewer drafts — <code>_describe_write</code>'s per-draft detail lines are enough to read at that size. Above 3, returns a compact table instead: one row per draft (index, source issue, assignee, summary), plus a trailing note when one or more drafts name no source issue.</li>
+<li><strong>Why:</strong> past ~3 detail blocks, a batch reads as a wall of near-identical text, and a batch that grew by one draft is invisible in it. The manifest is a scannable index that makes an odd row stand out before the detail blocks are read at all.</li>
+</ul>
+<p><strong><code>unchecked_scope_warning(messages: list[dict], calls: list[dict]) -&gt; str | None</code></strong></p>
+<ul>
+<li><strong>Does:</strong> filters <code>calls</code> to <code>create_jira_issue(s)</code> calls made with no <code>scope</code> argument. If none, returns <code>None</code>. Otherwise, extracts Jira issue keys (regex <code>[A-Z][A-Z0-9]*-\d+</code>) from the human's last message (<code>last_user_text</code>); if there are 3 or more, returns a <code>NOTE:</code> string naming them and how many drafts weren't checked against them. Otherwise <code>None</code>.</li>
+<li><strong>Why:</strong> the scope check (<code>create_jira_issues(scope=...)</code>) only runs when the <em>model</em> remembers to pass <code>scope</code> — nothing forces it to. This is a warning, not a block, on purpose: a heuristic that blocks anything is defeated by its first false positive. Its only job is to make sure "the check didn't run" is never silent.</li>
+</ul>
+<p><strong><code>describe_write(call: dict) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong> calls <code>_describe_write(call)</code> inside a <code>try</code>; on any exception, returns the raw tool name and arguments (via <code>brief</code>) plus the exception's type and message instead of propagating.</li>
+<li><strong>Why:</strong> the caller is about to print this text and then sit on a paused interrupt. A renderer crash must not take down the approval prompt with it — the human still needs to be able to see <em>something</em> and say no.</li>
+</ul>
+<hr />
+<h4><code>➕ main.py</code> — the terminal frontend</h4>
+<p><strong><code>build_assistant(on_route) -&gt; PMAssistant</code></strong></p>
+<ul>
+<li><strong>Does:</strong> if <code>LUCID_MCP_ENABLED</code> is set, calls <code>start_lucid()</code> (R2 / lesson 8) to get an <code>MCPSession</code> (or <code>None</code> on failure); returns <code>PMAssistant(hooks=[ConsoleEcho()], mcp=&lt;that session or None&gt;, on_route=on_route)</code>.</li>
+</ul>
+<p><strong>A route-printing callable, passed as <code>on_route</code></strong></p>
+<ul>
+<li><strong>Does:</strong> remembers the last route it printed; prints <code>[route: x]</code> only when the route actually changes between turns.</li>
+<li><strong>Why it matters:</strong> which lane a turn lands in decides which tools exist. Route it to the read-only query lane by mistake, and "the agent says it can't create a ticket" is indistinguishable from a genuine refusal — until this line tells you which lane actually ran.</li>
+</ul>
+<p><strong><code>main() -&gt; int</code></strong></p>
+<ul>
+<li><strong>Does, in order:</strong><ol>
+<li>Calls <code>_quiet_library_logs()</code> (below).</li>
+<li>Runs <code>env.validate()</code> then <code>env.validate_jira()</code>. On a <code>ValueError</code> from either, prints <code>Configuration error: &lt;message&gt;</code> and returns <code>1</code> — deliberately not a traceback, since a missing <code>.env</code> value is a user mistake, not a bug.</li>
+<li>Prints the banner plus the configured Jira base URL/project and model.</li>
+<li>Builds the route-printing callable and passes it to <code>build_assistant</code>.</li>
+<li>Loops reading a line of input. <code>/exit</code> or <code>/quit</code> returns <code>0</code>; <code>/help</code> reprints the banner; <code>/new</code> calls <code>assistant.reset()</code> and clears the route printer's memory; an empty line is ignored; anything else goes to <code>handle_turn</code>. A blank/EOF read (Ctrl-D/Ctrl-C at the main prompt) prints <code>Bye.</code> and returns <code>0</code>.</li>
+<li>Whatever way the loop exits, a <code>finally</code> calls <code>assistant.close()</code>.</li>
+</ol>
+</li>
+</ul>
+<p><strong><code>handle_turn(assistant, user_input, ask=input) -&gt; bool</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Calls <code>assistant.send(user_input)</code>.</li>
+<li>Prints <code>result.reply</code> only if it's non-empty. In practice that's only the requirements route: every other lane's reply was already printed as it happened, by <code>ConsoleEcho</code>; the requirements workflow runs its own write→review loop outside any <code>Agent</code>, so that hook never sees its output (lesson 7).</li>
+<li>Calls and returns <code>resolve_approvals(assistant, result, ask)</code>.</li>
+<li>If <code>assistant.send</code> raises <code>ContextWindowOverflowException</code>: calls <code>assistant.discard_pending()</code>, tells the user to type <code>/new</code>, and returns <code>True</code> (the CLI keeps running — a fresh conversation is the only fix, per lesson 4's <code>NullConversationManager</code> trade-off).</li>
+<li>On any other exception: calls <code>assistant.discard_pending()</code>, prints the error's type and message, and returns <code>True</code>.</li>
+</ol>
+</li>
+<li><strong>Why discard first, in both error paths:</strong> an approval left hanging wedges that lane for good (lesson 6 / R5) — clearing it before reporting the error is what keeps the next turn usable.</li>
+</ul>
+<p><strong><code>resolve_approvals(assistant, result, ask=input) -&gt; bool</code></strong></p>
+<ul>
+<li><strong>Does:</strong> while <code>result.pending</code> is non-empty: print every pending call via <code>describe_write</code>, print <code>unchecked_scope_warning(...)</code> if it returns one, ask <code>Approve? [y/N]</code> via <code>ask</code>, and call <code>result = assistant.resume(&lt;True/False&gt;)</code>. Repeats, because one turn can pause more than once. Returns <code>True</code> once nothing is pending.</li>
+<li><strong>Watch out:</strong> only the literal answers <code>y</code>/<code>yes</code> (case-insensitive) approve — an empty answer or anything else rejects. <code>EOFError</code>/<code>KeyboardInterrupt</code> (Ctrl-D/Ctrl-C) at the approval prompt calls <code>assistant.discard_pending()</code> and returns <code>False</code> immediately, instead of crashing or looping.</li>
+</ul>
+<p><strong><code>_quiet_library_logs()</code></strong></p>
+<ul>
+<li><strong>Does:</strong> reads <code>PMAGENT_LOG_LEVEL</code> (default <code>CRITICAL</code>) and sets it as the level of the <code>strands</code> logger.</li>
+<li><strong>Why:</strong> with no logging configured, Python prints <code>WARNING</code>+ records to stderr by default, so Strands' own informational lines (e.g. "moving an image from a tool message for OpenAI compatibility") would otherwise interleave with the chat. Errors still surface through the CLI's own error line regardless.</li>
+<li><strong>Watch out:</strong> keep this exact function name — R7's <code>web.py</code> imports it from <code>main</code>.</li>
+</ul>
 <p><strong>Your tests (<code>➕ tests/test_lanes.py</code>, <code>➕ tests/test_cli.py</code>) must cover:</strong></p>
 <div class="scroll"><table>
 <thead>
@@ -2442,72 +2947,511 @@ they're yours to change, since you write both the server and the page. Run
 </tr>
 </tbody>
 </table></div>
-<p>First extend what you have (your earlier tests must stay green):</p>
+<h3>First, extend what you already have</h3>
+<p>Five small signature changes to code from earlier steps. Your earlier tests must
+stay green after making them.</p>
 <ul>
-<li><code>router.classify_with_reason(messages, previous_route, model, usage_sink)</code>
-    returns <code>(route, "continuation" | "classifier")</code>; <code>classify</code> becomes a thin
-    wrapper. <code>PMAssistant</code> reports <code>"custom"</code> when an injected classifier decided.</li>
-<li><code>llm.structured(..., usage_sink=None)</code> calls <code>usage_sink(invocation_usage(…))</code>;
-    <code>draft_diagram_brief</code> passes <code>tool_context.invocation_state.get("usage_sink")</code>.</li>
-<li><code>requirements.run_requirements(..., on_step=None, usage_sink=None)</code>.</li>
-<li><code>make_lane_agent(..., callback_handler=None)</code>; lane calls pass
-    <code>invocation_state={"usage_sink": …}</code>.</li>
-<li><code>PMAssistant(..., on_route_decided=None, on_prd_step=None, callback_handler=None)</code>;
-    <code>TurnResult.route_reason</code> and <code>.usage</code>.</li>
+<li><strong><code>router.classify_with_reason(messages, previous_route, model, usage_sink) -&gt; (route, reason)</code></strong>
+    wraps the classifier you already wrote. <code>reason</code> is <code>"continuation"</code> when the
+    fast path kept the previous route with no model call, or <code>"classifier"</code> when
+    the model decided — the web UI shows this in the thinking chain, the CLI
+    doesn't need it. <code>classify(...)</code> becomes a one-line wrapper that returns just
+    the route. <code>PMAssistant</code> reports the route <code>"custom"</code> when the caller injected
+    its own <code>classify=</code> function instead (tests do this to skip the router).</li>
+<li><strong><code>llm.structured(..., usage_sink=None)</code></strong>: when given, call
+    <code>usage_sink(invocation_usage(result))</code> after the call. <code>draft_diagram_brief</code>
+    passes <code>tool_context.invocation_state.get("usage_sink")</code> through, so the
+    diagram lane's hidden structured-output call gets counted too.</li>
+<li><strong><code>requirements.run_requirements(..., on_step=None, usage_sink=None)</code></strong>: thread
+    both through <code>write</code>/<code>review</code>/the loop, so the web UI can show PRD progress
+    and count its tokens the same way.</li>
+<li><strong><code>make_lane_agent(..., callback_handler=None)</code></strong>: pass it straight to the
+    <code>Agent</code>. Still <code>None</code> by default, which is why the CLI stays silent between
+    <code>ConsoleEcho</code>'s own prints.</li>
+<li><strong><code>PMAssistant(..., on_route_decided=None, on_prd_step=None, callback_handler=None)</code></strong>:
+    <code>on_route_decided(route, reason)</code> fires instead of (not in addition to)
+    <code>on_route</code>, when set; <code>on_prd_step</code> is passed through to
+    <code>run_requirements</code>; <code>callback_handler</code> is passed through to every lane agent.
+    <code>TurnResult</code> grows <code>route_reason</code> and <code>usage</code> fields so callers can read what
+    happened without reaching into private state.</li>
 </ul>
-<p>Then the web package:</p>
-<ol>
-<li><code>➕ pmagent/web/problems.py</code>: an RFC 9457 <code>CATALOG</code> of problem slugs (title,
-    status), <code>ProblemError(slug, detail="", headers=None, **extra)</code>, exception handlers
-    that answer <code>application/problem+json</code>, and a <code>/problems/&lt;slug&gt;</code> page for each.</li>
-<li><code>➕ pmagent/web/schemas.py</code>: request and response models (a message of 1–20,000
-    characters; conversation, turn, event, approval with <code>ToolCall(id, name, args)</code>,
-    health and meta).</li>
-<li><code>➕ pmagent/web/trace.py</code>: <code>TraceRecorder</code>, a hook provider <strong>and</strong> a callback
-    handler, turning the loop into events (route, reasoning deltas, tool started and
-    finished with durations, approval, PRD steps, usage); <code>assistant_kwargs()</code>
-    returns the <code>PMAssistant</code> keyword arguments that wire it in.</li>
-<li><code>➕ pmagent/web/sessions.py</code>: <code>Turn</code> (an append-only event log with
-    <code>emit(kind, data, status=None)</code> and <code>wait_for_events</code>), <code>Approval</code>,
-    <code>ConversationSession</code> (a worker thread per turn, idempotency keys, <code>decide</code>,
-    cleanup on failure) and <code>SessionStore</code>.</li>
-<li><code>➕ pmagent/web/app.py</code>: <code>create_app(assistant_factory=None, *, api_token=None,
-    extra_hosts=(), enable_mcp=False)</code>, where a factory is <code>factory(recorder) -&gt;
-    PMAssistant(..., **recorder.assistant_kwargs())</code>. A <code>SecurityMiddleware</code>
-    (Host allowlist of <code>127.0.0.1</code>, <code>localhost</code> and <code>extra_hosts</code>; Origin check on
-    writes; a strict CSP and security headers everywhere, relaxed only on the API
-    docs); an optional bearer token; with <code>enable_mcp=True</code> (only <code>web.py</code> sets it)
-    and <code>LUCID_MCP_ENABLED</code>, one Lucid session for the server's lifetime, never per
-    conversation; the routes under <code>/api/v1</code>; and SSE through
-    <code>anyio.to_thread.run_sync(…, abandon_on_cancel=True, limiter=SSE_LIMITER)</code>, so
-    an open stream never blocks the event loop.</li>
-<li><strong>The page</strong>, which you write: <code>➕ pmagent/web/static/index.html</code>, <code>app.css</code>
-    and <code>app.js</code>. A chat window and a thinking-chain window; a reply rendered as
-    Markdown; an approval card showing the exact <code>describe_write</code> text with Reject
-    and Approve (nothing approved by default); a token prompt on a 401; and after a
-    reload, the chat rebuilt from <code>GET …/turns</code>. Rules: <strong>no inline <code>&lt;script&gt;</code>, no
-    <code>style=</code> and no <code>on*=</code> attributes</strong> (the CSP forbids them); model output is
-    rendered with <code>marked</code> and then sanitised with <code>DOMPurify</code>, with <code>img</code>
-    forbidden. Download the browser builds that define globals yourself, for
-    example <code>marked@15.0.12/marked.min.js</code> and <code>dompurify@3.2.6/dist/purify.min.js</code>
-    from the npm CDN, into <code>➕ pmagent/web/static/vendor/</code>, and record each file's
-    version, source URL and SHA-256 in <code>➕ vendor/README.md</code>.</li>
-<li><code>➕ web.py</code>: <code>build_server(host, port, allowed_hosts)</code> and <code>main(argv)</code> with
-    <code>--host</code> (default <code>127.0.0.1</code>), <code>--port</code> and <code>--allowed-host</code>. Like <code>main.py</code> it
-    first runs <code>env.validate()</code> and <code>validate_jira()</code>. Then it refuses a
-    non-loopback host without <code>PMAGENT_API_TOKEN</code>, and <code>0.0.0.0</code> without an
-    <code>--allowed-host</code> (the wildcard is a bind address, never a Host name). The
-    banner shows <code>localhost</code> for a wildcard bind.</li>
-<li><code>➕ scripts/__init__.py</code> (empty) and <code>➕ scripts/demo_web.py</code>: the web UI
-    offline. Run as a script, it first puts the project root on <code>sys.path</code> (a
-    script's own folder is what Python adds). A <code>DemoJira</code> fake client (<code>search_issues_page</code>, <code>add_comments</code>, a
-    class-level <code>comments</code> list), <code>configure()</code> pointing the Jira tools'
-    <code>get_client</code> at it, <code>factory(recorder)</code> returning a <code>PMAssistant</code> with a
-    <code>ScriptedModel</code> that answers three prompts ("Is the FX epic at risk?" →
-    reasoning and a tool call; "Post a comment on DEMO-101" → the approval card;
-    "Write a PRD from these notes: …" → the writer/reviewer loop) and a fallback,
-    and <code>main()</code> with <code>--host</code> and <code>--port</code>.</li>
+<h3>1. <code>➕ pmagent/web/problems.py</code> — one error shape for the whole API</h3>
+<p>Purpose: every error response is <code>application/problem+json</code> (RFC 9457), so a
+client switches on one stable <code>type</code> field instead of parsing prose, and a
+human who hits an error can open that <code>type</code> URL and read what it means.</p>
+<p><strong><code>CATALOG: dict[str, tuple[status, title, explanation]]</code></strong></p>
+<ul>
+<li><strong>Does:</strong> one entry per problem slug (see the "problem slugs" table above),
+    each with its HTTP status, a short title, and a longer explanation.</li>
+<li><strong>Why:</strong> the explanation isn't wasted — <code>install()</code> below serves it as a real
+    page at <code>/problems/&lt;slug&gt;</code>.</li>
+</ul>
+<p><strong><code>ProblemError(slug, detail="", headers=None, **extra)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> an exception you raise from inside any route. It looks up <code>status</code>
+    and <code>title</code> from <code>CATALOG[slug]</code> immediately, and keeps <code>detail</code>, optional
+    response <code>headers</code>, and any <code>**extra</code> keyword fields (e.g. <code>turn=turn.id</code>,
+    <code>approval=approval.id</code>) to merge into the JSON body later.</li>
+<li><strong>Why:</strong> routes raise this one exception type instead of building a
+    <code>JSONResponse</code> by hand each time; one handler (below) turns every instance
+    into the same shape.</li>
+</ul>
+<p><strong><code>problem_body(slug, detail="", instance="", **extra) -&gt; dict</code></strong></p>
+<ul>
+<li><strong>Does:</strong> builds <code>{"type": f"/problems/{slug}", "title": ..., "status": ...}</code>,
+    adding <code>detail</code> and <code>instance</code> only when given (never as empty strings), then
+    merges in <code>**extra</code>.</li>
+</ul>
+<p><strong><code>problem_response(slug, detail="", instance="", headers=None, **extra) -&gt; JSONResponse</code></strong></p>
+<ul>
+<li><strong>Does:</strong> wraps <code>problem_body(...)</code> in a <code>JSONResponse</code> with
+    <code>media_type="application/problem+json"</code> and the given status and headers.</li>
+</ul>
+<p><strong><code>install(app)</code></strong></p>
+<ul>
+<li><strong>Does, in order:</strong><ol>
+<li>Registers a handler for <code>ProblemError</code> that turns it into a
+ <code>problem_response</code> (using <code>request.url.path</code> as <code>instance</code>).</li>
+<li>Registers a handler for FastAPI's <code>RequestValidationError</code> that returns the
+ <code>"validation"</code> slug, with each field's error listed under <code>errors</code>.</li>
+<li>Registers a handler for Starlette's generic <code>HTTPException</code>, mapped by
+ status code (<code>404 → not-found</code>, <code>405 → method-not-allowed</code>,
+ <code>401 → unauthorized</code>); anything else falls back to a plain
+ <code>{"type": "about:blank", ...}</code> body rather than inventing a slug for it.</li>
+<li>Adds <code>GET /problems/{slug}</code>, which renders the matching catalog entry as a
+ small HTML page (an unknown slug is a 404, not a crash).</li>
 </ol>
+</li>
+<li><strong>Watch out:</strong> for the generic-<code>HTTPException</code> fallback, FastAPI's own
+    boilerplate detail strings (<code>"Not Found"</code>, <code>"Method Not Allowed"</code>) are
+    dropped rather than shown as <code>detail</code> — that field is meant to explain a
+    <em>cause</em>, not restate the status.</li>
+</ul>
+<h3>2. <code>➕ pmagent/web/schemas.py</code> — request and response models</h3>
+<p>Purpose: every API body is a typed Pydantic model, so FastAPI validates input,
+documents output, and the OpenAPI document at <code>/api/v1/openapi.json</code> (browsed
+at <code>/api/docs</code>) matches exactly what the server does. Conventions to follow
+throughout:</p>
+<ul>
+<li>snake_case fields; timestamps are ISO-8601 UTC strings ending in <code>Z</code>.</li>
+<li>Ids are opaque, prefixed strings (<code>conv_…</code>, <code>turn_…</code>, <code>apr_…</code>) — a client
+    must treat them as tokens, never parse them.</li>
+<li>Use an explicit <code>status</code> string enum (<code>Literal[...]</code>) instead of a pile of
+    booleans that would otherwise multiply as states are added.</li>
+<li>Wrap collections as <code>{"items": [...]}</code> so a field can be added later without
+    breaking a client that reads the list directly.</li>
+<li>Every resource carries the URL(s) a client needs next (<code>events_url</code>,
+    <code>decision_url</code>, <code>turns_url</code>) — a client follows links instead of building
+    paths itself.</li>
+</ul>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Fields worth noting</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Problem</code></td>
+<td>the RFC 9457 shape itself: <code>type</code>, <code>title</code>, <code>status</code>, optional <code>detail</code>/<code>instance</code></td>
+</tr>
+<tr>
+<td><code>Usage</code></td>
+<td><code>input_tokens</code>, <code>output_tokens</code>, <code>total_tokens</code>, <code>model_calls</code> — all default to <code>0</code></td>
+</tr>
+<tr>
+<td><code>Health</code></td>
+<td>just <code>status: "ok"</code></td>
+</tr>
+<tr>
+<td><code>Meta</code></td>
+<td>model/provider, Jira project, <code>lanes</code>, <code>reasoning_available</code> + a <code>reasoning_note</code> explaining why, <code>lucid_connected</code>, <code>auth_required</code></td>
+</tr>
+<tr>
+<td><code>TurnCreate</code></td>
+<td><code>message</code>, 1–20,000 characters; a <code>field_validator</code> also rejects a message that's only whitespace after stripping</td>
+</tr>
+<tr>
+<td><code>DecisionCreate</code></td>
+<td><code>decision: Literal["approve", "reject"]</code></td>
+</tr>
+<tr>
+<td><code>ToolCall</code></td>
+<td><code>id</code>, <code>name</code>, <code>args</code> — one gated call</td>
+</tr>
+<tr>
+<td><code>ApprovalOut</code></td>
+<td><code>status</code> is one of <code>pending/approved/rejected/abandoned</code>; <code>descriptions</code> is the CLI's own <code>describe_write</code> text, one per call; <code>warning</code> is the scope-check text or <code>None</code>; <code>decision_url</code></td>
+</tr>
+<tr>
+<td><code>Event</code></td>
+<td><code>id</code>, <code>event</code> (the kind string), <code>data</code></td>
+</tr>
+<tr>
+<td><code>TurnOut</code> / <code>TurnDetail</code></td>
+<td><code>TurnDetail</code> is <code>TurnOut</code> plus <code>events: list[Event]</code> — used wherever a turn's full history matters (e.g. rebuilding the page after a reload)</td>
+</tr>
+<tr>
+<td><code>TurnList</code></td>
+<td><code>{"items": list[TurnDetail]}</code></td>
+</tr>
+<tr>
+<td><code>ConversationOut</code></td>
+<td><code>status</code> (<code>idle/running/awaiting_approval</code>), <code>messages: list[TranscriptItem]</code>, <code>pending_approval</code></td>
+</tr>
+</tbody>
+</table></div>
+<h3>3. <code>➕ pmagent/web/trace.py</code> — TraceRecorder: agent lifecycle → chain events</h3>
+<p>Purpose: one object that is <em>both</em> a Strands hook provider and a Strands
+callback handler for every lane agent in one conversation, turning what the
+agent loop does into the flat sequence of <code>{event, data}</code> records the SSE
+stream sends. It doesn't know about HTTP at all — <code>sessions.py</code> points its
+<code>emit</code> at the turn that's currently running.</p>
+<p>Two different ways to watch an agent, used together:</p>
+<ul>
+<li>the <strong>callback handler</strong> gets stream-level chunks as they arrive — text
+    deltas and reasoning deltas. This is what makes the UI feel live.</li>
+<li><strong>hooks</strong> get whole lifecycle events with structure — a tool's name, input,
+    result and duration; a completed assistant message.</li>
+</ul>
+<p>Two more event kinds come from <em>outside</em> the agent loop entirely, reported by
+<code>PMAssistant</code> callbacks instead of hooks: the route decision, and each step of
+the PRD writer/reviewer loop.</p>
+<p><strong><code>assistant_kwargs() -&gt; dict</code></strong></p>
+<ul>
+<li><strong>Does:</strong> returns <code>{"hooks": [self], "callback_handler": self,
+    "on_route_decided": self.route_decided, "on_prd_step": self.prd_step}</code> —
+    everything a <code>PMAssistant</code> needs to report into this one recorder.</li>
+</ul>
+<p><strong><code>register_hooks(registry, **kwargs)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> subscribes <code>_before_tool</code> to <code>BeforeToolCallEvent</code>, <code>_after_tool</code> to
+    <code>AfterToolCallEvent</code>, and <code>_message_added</code> to <code>MessageAddedEvent</code>.</li>
+</ul>
+<p><strong><code>__call__(**kwargs)</code></strong> (this <em>is</em> the callback handler)</p>
+<ul>
+<li><strong>Does:</strong> if the chunk carries <code>reasoningText</code>, emit <code>reasoning.delta</code>;
+    else if it carries <code>data</code> (plain text), emit <code>text.delta</code>. Anything else is
+    ignored.</li>
+</ul>
+<p><strong><code>_before_tool(event)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> records <code>time.monotonic()</code> against this call's <code>toolUseId</code>, then
+    emits <code>tool.started</code> with <code>{tool_use_id, name, input}</code>.</li>
+</ul>
+<p><strong><code>_after_tool(event)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> computes a duration — Strands' own <code>event.duration</code> if it gave one,
+    else the wall-clock time since <code>_before_tool</code> recorded it; truncates the
+    result text to 2,000 characters for display (<code>_preview</code>, which also reports
+    whether it truncated); counts how many <code>image</code> blocks are in the result;
+    emits <code>tool.finished</code> with the tool's name, status, <code>duration_ms</code>, the
+    preview text, <code>output_truncated</code>, and the image count.</li>
+<li><strong>Watch out:</strong> the truncation is a <em>display</em> limit only. The model itself
+    still receives the tool's full, untruncated result — only the chain the
+    human watches is shortened.</li>
+</ul>
+<p><strong><code>_message_added(event)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> ignores anything that isn't an assistant message; joins the text of
+    any <code>reasoningContent</code> blocks in it; emits <code>message.completed</code> with the
+    message's own text, the names of any tools it called, and whether it carried
+    reasoning at all.</li>
+</ul>
+<p><strong><code>route_decided(route, reason)</code></strong> / <strong><code>prd_step(kind, data)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> <code>route_decided</code> emits <code>route.decided</code> with the route, the lane name
+    it maps to, and the reason; <code>prd_step</code> emits <code>prd.step</code> with
+    <code>{"step": kind, **data}</code>.</li>
+</ul>
+<h3>4. <code>➕ pmagent/web/sessions.py</code> — Turn, Approval, ConversationSession, SessionStore</h3>
+<p>Purpose: the web twin of <code>main.py</code>'s terminal loop — one <code>PMAssistant</code> per
+conversation, driven by HTTP requests instead of stdin, with the same rules
+carried over on purpose: a failed turn calls <code>assistant.discard_pending()</code> so
+a crash never wedges the conversation on an unanswerable approval, and the
+approval text is exactly the CLI's (<code>describe_write</code>,
+<code>unchecked_scope_warning</code>). One difference from the CLI: a new message that
+arrives while an approval is waiting is refused with 409 instead of silently
+abandoning the approval — an API shouldn't throw away a pending decision as a
+side effect of the next request.</p>
+<p>Concurrency model: Strands' <code>agent(...)</code> call is synchronous, so each turn runs
+on its own worker thread; a lock per conversation allows one turn at a time
+<em>within</em> that conversation while separate conversations run fully in parallel.
+Everything lives in memory — a restart forgets every conversation, exactly
+like the CLI forgets on exit.</p>
+<p><strong><code>Turn</code></strong> — one user message and everything the agent did about it: an
+append-only, thread-safe event log.</p>
+<ul>
+<li><strong><code>emit(kind, data, status=None) -&gt; None</code></strong><ul>
+<li><strong>Does:</strong> under one lock, appends <code>{id, event: kind, data: {ts, turn_id,
+**data}}</code> to the log, and — in that same critical section, only if a
+<code>status</code> was given — updates the turn's status too, then wakes any waiter.</li>
+<li><strong>Why:</strong> so no reader can ever observe a new event without the status
+change it caused. <code>approval.required</code> and the <code>awaiting_approval</code> status
+always arrive together, atomically — a <code>GET</code> in between can't see one
+without the other.</li>
+</ul>
+</li>
+<li><strong><code>wait_for_events(after, timeout) -&gt; (new_events, resting)</code></strong><ul>
+<li><strong>Does:</strong> blocks on a <code>threading.Condition</code> until either there are events
+past index <code>after</code>, the turn reaches a resting status (<code>RESTING =
+{"awaiting_approval", "completed", "failed"}</code>), or <code>timeout</code> elapses; then
+returns the new events and whether the turn is now resting.</li>
+<li><strong>Watch out:</strong> this must run on a worker thread, never on the asyncio
+event loop — see the SSE route in <code>app.py</code> below for how that's enforced.</li>
+</ul>
+</li>
+</ul>
+<p><strong><code>ConversationSession</code></strong></p>
+<ul>
+<li><strong><code>start_turn(message, idempotency_key=None) -&gt; (Turn, created: bool)</code></strong><ul>
+<li><strong>Does, in order:</strong> hash the request body; if <code>idempotency_key</code> was seen
+before, compare the stored hash — a matching body returns the <em>original</em>
+turn with <code>created=False</code> (a safe retry), a different body raises
+<code>idempotency-key-reuse</code>; otherwise, if a turn is already running, raise
+<code>turn-in-progress</code>; otherwise, if an approval is pending, raise
+<code>approval-pending</code>; otherwise create the <code>Turn</code>, store it, point the
+recorder's <code>emit</code> at it, remember the idempotency key (only once the turn
+is guaranteed to exist), emit <code>turn.started</code>, and spawn a worker thread
+that calls <code>assistant.send(message)</code>.</li>
+<li><strong>Why the idempotency check runs first:</strong> a retried request has to return
+the same turn it got the first time, even if, by the time the retry
+arrives, the conversation now looks "in progress" or "pending" from a
+fresh caller's point of view.</li>
+</ul>
+</li>
+<li><strong><code>decide(approval_id, decision) -&gt; Turn</code></strong><ul>
+<li><strong>Does:</strong> looks up the approval by id (<code>not-found</code> if it doesn't exist);
+if it was already decided the <em>same</em> way, returns its turn unchanged (an
+idempotent repeat); if it's not <code>pending</code> at all, raises
+<code>approval-not-pending</code>; otherwise marks it decided, puts its turn back to
+<code>running</code>, emits <code>approval.decided</code>, and spawns a worker thread that calls
+<code>assistant.resume(decision == "approve")</code>.</li>
+</ul>
+</li>
+<li><strong><code>discard()</code></strong> (backs <code>DELETE /conversations/{id}</code>)<ul>
+<li><strong>Does:</strong> refuses with <code>turn-in-progress</code> while a turn is still running;
+otherwise marks any pending approval <code>abandoned</code> and calls
+<code>assistant.discard_pending()</code>.</li>
+</ul>
+</li>
+<li><strong><code>_run(turn, work)</code></strong> (what actually executes on the worker thread)<ul>
+<li><strong>Does:</strong> calls <code>work()</code>; a <code>ContextWindowOverflowException</code> fails the turn
+with the <code>context-full</code> slug; any other exception fails it with
+<code>turn-failed</code> and that exception's message; a successful result is handed
+to <code>_finish</code>, and if <code>_finish</code> itself raises, the turn <em>still</em> fails with
+<code>turn-failed</code> rather than being left stuck in <code>running</code> forever.</li>
+</ul>
+</li>
+<li><strong><code>_finish(turn, result)</code></strong><ul>
+<li><strong>Does:</strong> records the route and usage on the turn and emits <code>usage</code>; if
+the result has pending tool calls, builds an <code>Approval</code> — using
+<code>describe_write</code> and <code>unchecked_scope_warning</code>, the same functions the CLI
+uses, so the two frontends never disagree about what a write does — stores
+it, and emits <code>approval.required</code> with status <code>awaiting_approval</code>, all
+under one lock; otherwise it emits <code>turn.completed</code> with the reply and
+marks the turn <code>completed</code>.</li>
+<li><strong>Why the approval is stored and announced under one lock:</strong> a <code>decide()</code>
+call racing this must never observe the approval before the turn is
+actually resting, or it could try to resume a turn that hasn't finished
+pausing yet.</li>
+</ul>
+</li>
+<li><strong><code>_fail(turn, slug, detail="")</code></strong><ul>
+<li><strong>Does:</strong> the same cleanup <code>main.handle_turn</code> performs on the CLI —
+abandon any pending approval, then call <code>assistant.discard_pending()</code>,
+swallowing any exception <em>that</em> raises (a cleanup failure must never mask
+the real error) — then emits <code>turn.failed</code> with a problem body.</li>
+</ul>
+</li>
+</ul>
+<p><strong><code>SessionStore</code></strong></p>
+<ul>
+<li><strong>Does:</strong> an in-memory <code>{conversation_id: ConversationSession}</code> map behind a
+    lock, with <code>create()</code>, <code>get()</code> (raises <code>not-found</code>), and <code>delete()</code> (calls
+    <code>discard()</code> first, then removes the entry).</li>
+</ul>
+<h3>5. <code>➕ pmagent/web/app.py</code> — the FastAPI app: routes, security, lifespan</h3>
+<p><strong><code>SecurityMiddleware(app, allowed_hosts)</code></strong> — plain ASGI middleware, not
+FastAPI's <code>BaseHTTPMiddleware</code>, specifically so it never buffers the SSE
+stream while inspecting it.</p>
+<ul>
+<li><strong>Does, per request:</strong> picks the CSP (the relaxed <code>DOCS_CSP</code> only for paths
+    under <code>/api/docs</code>, <code>STRICT_CSP</code> everywhere else); rejects with <code>bad-host</code>
+    (400) if the <code>Host</code> header's hostname isn't in <code>allowed_hosts</code>; for any
+    method other than <code>GET</code>/<code>HEAD</code>/<code>OPTIONS</code> that carries an <code>Origin</code> header,
+    rejects with <code>forbidden-origin</code> (403) unless that origin matches this
+    server's own scheme+host; otherwise passes the request through, adding the
+    CSP plus <code>X-Content-Type-Options: nosniff</code>, <code>Referrer-Policy: no-referrer</code>
+    and <code>X-Frame-Options: DENY</code> to every response, including its own refusals.</li>
+<li><strong>Why two separate checks:</strong> they stop two different attacks, and neither
+    substitutes for the other. The <strong>Host</strong> check stops DNS rebinding — a
+    hostile page that tricks the browser into resolving <em>its own domain</em> to
+    127.0.0.1 still sends that domain's name in the <code>Host</code> header, so checking
+    it first refuses the request before anything else runs. The <strong>Origin</strong>
+    check stops CSRF — a state-changing request is only honoured if it was
+    actually sent by the page this server itself serves, not merely aimed at
+    the right host.</li>
+</ul>
+<p><strong><code>create_app(assistant_factory=None, *, api_token=None, extra_hosts=(), enable_mcp=False) -&gt; FastAPI</code></strong></p>
+<ul>
+<li><strong>Does:</strong> builds the <code>FastAPI</code> app with a <code>lifespan</code> that, only when both
+    <code>enable_mcp</code> and <code>env.LUCID_MCP_ENABLED</code> are true, starts one Lucid MCP
+    session for the <em>whole server's</em> lifetime (not one per conversation) and
+    closes it on shutdown; installs the problem-response handlers
+    (<code>problems.install</code>); adds <code>SecurityMiddleware</code> with allowed hosts
+    <code>{"127.0.0.1", "localhost", *extra_hosts}</code>; wires an optional bearer-token
+    dependency (<code>require_token</code> — a no-op when no token is configured, otherwise
+    a constant-time <code>hmac.compare_digest</code> check so response timing can't leak
+    the token); registers every route under <code>/api/v1</code>; mounts
+    <code>pmagent/web/static/</code> at <code>/static</code>; and serves <code>index.html</code> at <code>/</code>.</li>
+<li><strong>Why <code>enable_mcp</code> is separate from <code>LUCID_MCP_ENABLED</code>:</strong> only <code>web.py</code>
+    passes <code>enable_mcp=True</code>. Tests and the offline demo build the app through
+    this same factory without ever starting a real MCP client, even if
+    <code>LUCID_MCP_ENABLED=true</code> happens to be set in the test environment — one
+    flag is "the feature is turned on", the other is "and this particular
+    caller actually wants it".</li>
+</ul>
+<p>Route behaviour worth calling out beyond the routes table above:</p>
+<ul>
+<li><code>POST …/turns</code>: 202 + <code>Location</code>; the body is validated by <code>TurnCreate</code>
+    (1–20,000 characters, whitespace-only rejected); an optional
+    <code>Idempotency-Key</code> header (max 200 characters) makes a retry return the
+    <em>same</em> turn instead of running the model a second time.</li>
+<li><code>GET …/turns/{id}/events</code> (SSE): resumes from the <code>Last-Event-ID</code> header if
+    the client reconnects, else from <code>?after=</code>; each loop iteration waits for
+    new events (off the event loop — see below), forwards any it gets, and
+    closes the stream once the turn is resting with nothing left to send, or
+    the client disconnects.</li>
+<li><strong>Why the SSE wait goes through <code>anyio.to_thread.run_sync(..., limiter=SSE_LIMITER)</code>:</strong>
+    <code>Turn.wait_for_events</code> blocks on a <code>threading.Condition</code>. Calling it directly
+    from an <code>async def</code> route would block the <em>entire</em> event loop until an event
+    arrives — stalling every other request, including ones for unrelated
+    conversations. Running it on a worker thread fixes that; the limiter
+    (<code>SSE_LIMITER = anyio.CapacityLimiter(16)</code>) caps how many idle SSE
+    connections can occupy worker threads at once, so a pile of open browser
+    tabs can't starve ordinary requests either.</li>
+<li><code>GET …/turns</code> returns every turn <em>with</em> its events (<code>detail=True</code>) — this is
+    what lets the page rebuild both the chat and the full thinking chain after a
+    reload, without trying to replay an SSE stream from scratch.</li>
+</ul>
+<h3>6. The page — <code>➕ pmagent/web/static/index.html</code>, <code>app.css</code>, <code>app.js</code></h3>
+<p>You write this file's actual content; these are the rules it has to satisfy,
+not a function-by-function spec.</p>
+<p><strong>What it must show:</strong></p>
+<ul>
+<li>A chat window and a thinking-chain window, side by side or toggled.</li>
+<li>Assistant replies rendered as Markdown.</li>
+<li>An approval card that shows the <em>exact</em> text <code>describe_write</code> produced on
+    the server — never re-derived in JavaScript — with Reject and Approve
+    buttons, neither pre-selected.</li>
+<li>A token prompt when a request comes back 401.</li>
+<li>After a reload, the chat and chain are rebuilt from <code>GET …/turns</code> (each turn
+    already carries its own events, per item 5 above) rather than trying to
+    resume a live SSE connection.</li>
+</ul>
+<p><strong>What the CSP in <code>app.py</code> forbids, and what that means for this file:</strong> no
+inline <code>&lt;script&gt;</code> tag, no <code>style="..."</code> attribute, and no <code>on*=</code> handler
+attribute anywhere in the HTML or generated by the JS — the
+<code>Content-Security-Policy</code> header blocks all three outright, so violating this
+rule doesn't fail a lint, it fails silently (and confusingly) in the browser
+at runtime. All behaviour lives in <code>app.js</code>, loaded as an external script; all
+styling lives in <code>app.css</code>.</p>
+<p><strong>Sanitizing model output — and why the CSP alone isn't enough:</strong> render
+model text with <code>marked</code>, then pass the resulting HTML through
+<code>DOMPurify.sanitize(html, {FORBID_TAGS: ["img", "style", "form", "iframe",
+"svg", "math", "input", "button"]})</code> before inserting it into the page. The
+CSP stops a <code>&lt;script&gt;</code> tag from <em>executing</em>, but it does nothing about
+HTML-injection tricks like <code>&lt;img src=x onerror="..."&gt;</code> sitting in text the
+model produced — DOMPurify is the layer that strips those out before they
+ever reach the DOM.</p>
+<p><strong>Vendoring, not a CDN:</strong> download the browser builds yourself — for example
+<code>marked@15.0.12/marked.min.js</code> and <code>dompurify@3.2.6/dist/purify.min.js</code> from
+the npm CDN — into <code>➕ pmagent/web/static/vendor/</code>, so the page loads no
+third-party script at runtime and still works with no network. Record each
+file's version, source URL and SHA-256 in
+<code>➕ pmagent/web/static/vendor/README.md</code>; a test checks the hashes on every
+run, so upgrading a library is a deliberate, reviewed edit rather than a
+silent supply-chain surface.</p>
+<h3>7. <code>➕ web.py</code> — <code>build_server</code>, <code>main</code></h3>
+<p><strong><code>build_server(host="127.0.0.1", port=8000, allowed_hosts=()) -&gt; uvicorn.Server</code></strong></p>
+<ul>
+<li><strong>Does:</strong> adds <code>host</code> itself to the Host allowlist unless it's already
+    loopback or a wildcard bind address (<code>0.0.0.0</code> / <code>::</code> — neither of which a
+    browser ever sends as a <code>Host</code> header, so listing them there would be
+    meaningless); calls <code>create_app(api_token=env.PMAGENT_API_TOKEN,
+    extra_hosts=..., enable_mcp=True)</code>; wraps it in a single-worker,
+    no-reload <code>uvicorn.Server</code>.</li>
+<li><strong>Why single-worker, no reload:</strong> a reload subprocess or extra worker
+    process wouldn't inherit whatever the <em>current</em> process already did before
+    importing this module — in particular, R8's write-blocking <code>smoke.py</code>
+    patches <code>requests.Session.request</code> in-process, and a forked worker would
+    simply bypass that patch and be able to write for real.</li>
+</ul>
+<p><strong><code>main(argv) -&gt; int</code></strong></p>
+<ul>
+<li><strong>Does, in order:</strong> parses <code>--host</code> (default <code>127.0.0.1</code>), <code>--port</code>, and
+    repeatable <code>--allowed-host</code>; runs <code>env.validate()</code> and <code>validate_jira()</code>,
+    printing <code>Configuration error: …</code> and returning 1 on failure, exactly like
+    <code>main.py</code>; if the host isn't loopback, refuses to start unless
+    <code>PMAGENT_API_TOKEN</code> is set; if the host is a wildcard bind, <em>also</em> refuses
+    unless at least one <code>--allowed-host</code> was given; otherwise prints a
+    plaintext-HTTP warning; prints a banner (showing <code>localhost</code> in place of a
+    wildcard bind, since that's not a URL anyone can put in a browser) and runs
+    the server.</li>
+<li><strong>Why a wildcard bind needs <code>--allowed-host</code>:</strong> <code>0.0.0.0</code> is only where the
+    socket listens — it is never the name a client's browser sends in its
+    <code>Host</code> header. Without an explicit <code>--allowed-host</code>, <code>SecurityMiddleware</code>'s
+    allowlist would reject every real request that reaches a wildcard-bound
+    server, so whatever DNS or LAN name clients will actually type has to be
+    named up front.</li>
+</ul>
+<h3>8. <code>➕ scripts/__init__.py</code> (empty) and <code>➕ scripts/demo_web.py</code></h3>
+<p>Purpose: the real app end to end — same <code>PMAssistant</code>, same Strands agents,
+same approval gate, same web server — with a <code>ScriptedModel</code> standing in for
+the LLM and a fake Jira client standing in for the real one, so lessons 10–11
+need no API key and no Jira. Run as a script, it first puts the project root
+on <code>sys.path</code> (only the script's own folder is added automatically).</p>
+<p><strong><code>DemoJira</code></strong></p>
+<ul>
+<li><strong>Does:</strong> stands in for the real Jira client. <code>search_issues_page</code> always
+    returns the same three made-up issues; <code>add_comments</code> appends
+    <code>(issue_keys, comment)</code> to a class-level list instead of writing anywhere.</li>
+</ul>
+<p><strong><code>configure()</code></strong></p>
+<ul>
+<li><strong>Does:</strong> sets <code>env.LLM_PROVIDER</code> / <code>LLM_MODEL</code> / <code>JIRA_PROJECT_KEY</code> to demo
+    values, and <code>env.JIRA_BASE_URL = None</code> so <code>/meta</code> never names a real
+    tenant; turns reasoning on (<code>LLM_REASONING_EFFORT="high"</code>,
+    <code>LLM_REASONING_SUMMARY="detailed"</code>) so the thinking chain has something to
+    show; points both Jira tool modules' <code>get_client</code> at <code>DemoJira</code>.</li>
+</ul>
+<p><strong><code>scripts() -&gt; dict[str, list]</code></strong></p>
+<ul>
+<li><strong>Does:</strong> returns a fresh queue of scripted turns per conversation, keyed by
+    a word found in the conversation's first message (<code>"risk"</code>, <code>"comment"</code>,
+    <code>"prd"</code>). Each queued turn is either a literal list of model blocks, or a
+    <code>messages -&gt; blocks</code> function — used for the <code>"comment"</code> script's second
+    turn, which has to look at whether the write was approved or rejected
+    before deciding what the model says next.</li>
+</ul>
+<p><strong><code>factory(recorder)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> builds a <code>PMAssistant</code> whose <code>classify=</code> looks up the route from
+    the keyword directly (<code>ROUTES.get(_key(messages), "query")</code>), skipping the
+    router entirely so no scripted turn is spent classifying; its model's
+    <code>next_turn(messages)</code> pops the next scripted turn for that conversation's
+    keyword, or returns the fallback <code>UNKNOWN</code> text once the queue for that
+    keyword is empty or no keyword matched at all.</li>
+</ul>
+<p><strong><code>main(argv)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> parses <code>--host</code>/<code>--port</code>, calls <code>configure()</code>, prints the three
+    example prompts, and serves <code>create_app(factory)</code> directly with uvicorn.
+    Unlike <code>web.py::main</code>, it never calls <code>env.validate()</code> / <code>validate_jira()</code> —
+    the demo supplies every value itself and needs no real credentials at all.</li>
+</ul>
 <p><strong>Your tests (<code>➕ tests/test_web_api.py</code> with FastAPI's <code>TestClient</code>,
 <code>➕ tests/test_web_entry.py</code>, <code>➕ tests/test_web_concurrency.py</code>) must cover:</strong></p>
 <div class="scroll"><table>
@@ -2559,10 +3503,18 @@ offline demo at http://127.0.0.1:8000. Click through all three prompts.</p>
 impossible.</p>
 <ol>
 <li>
-<p><code>➕ scripts/smoke.py</code>: the real CLI (or with <code>--web</code>, the web UI via
-    <code>web.main</code>), with <strong>every HTTP write blocked below the app</strong>. Every request
-    the domain code makes ends in <code>requests.Session.request</code>, so wrap that one
-    method with a <strong>fail-closed allowlist</strong>:</p>
+<p><code>➕ scripts/smoke.py</code> — a launcher that runs the real CLI or web UI, on the
+    real model and the real Jira, with every write physically blocked underneath
+    the app. The point is to let you press <strong>y</strong> at an approval prompt and prove
+    the gate works, instead of just hoping nobody types it.</p>
+<p><strong>What it does, in order:</strong>
+1. Sets <code>LUCID_MCP_ENABLED=false</code> and puts the project root on <code>sys.path</code>,
+  <strong>before importing anything from <code>pmagent</code></strong>. Running <code>scripts/smoke.py</code>
+  directly only adds <code>scripts/</code> to the path, not the project root, so this
+  has to happen first or the later imports fail.
+2. Wraps <code>requests.Session.request</code> — the one method every domain HTTP call
+  ends in, whether it's a plain <code>requests.get(...)</code> or the Jira/Confluence
+  <code>Session</code> object — with a <strong>fail-closed allowlist</strong>:</p>
 <div class="scroll"><table>
 <thead>
 <tr>
@@ -2589,14 +3541,35 @@ impossible.</p>
 </tr>
 </tbody>
 </table></div>
-<p>Install the block, and set <code>LUCID_MCP_ENABLED=false</code> (Lucid's client doesn't
-use <code>requests</code>), <strong>before</strong> anything imports <code>pmagent</code>; then put the project
-root on <code>sys.path</code> (running <code>scripts/smoke.py</code> adds only <code>scripts/</code>). Before
-handing over, run a self-check: a blocked POST must raise, or the launcher
-refuses to start. The FY converter
-writes local files, so replace <code>convert_fy_budget</code> in the FY <code>pipeline</code>
-module with a function that raises the same error. The LLM SDKs use <code>httpx</code>, so model
-calls are unaffected.
+<p>Match on the exact path, not the full URL — a query string must not be
+  able to smuggle a write past the allowlist by appending something that
+  looks like the JQL path.
+3. Replaces <code>convert_fy_budget</code> on the FY budget <code>pipeline</code> module with a
+  function that raises the same error. The FY converter writes local files
+  directly; it never goes through <code>requests</code>, so the HTTP wrapper above
+  can't catch it, and it needs its own block. (The finance tool imports
+  <code>convert_fy_budget</code> from the module at call time, so patching the module
+  attribute is enough — you don't need to patch every caller.)
+4. Runs a <strong>self-check</strong> before starting anything: fire a handful of writes
+  (an issue create, a comment, a PUT, a spreadsheet write, …) through the
+  wrapped <code>requests.Session.request</code> and confirm every one of them raises,
+  that the two allowlisted requests still pass, and that the FY patch
+  raises too. If any of that fails, the launcher exits instead of starting
+  — it should never be possible to run "live" with a block that silently
+  isn't there.
+5. Only then imports and runs <code>main.main()</code> (or, with <code>--web</code>, <code>web.main()</code>
+  in the same process — the block is a process-wide patch, so one process
+  is what makes it cover the whole server).</p>
+<p><strong>Why:</strong> the block has to be fail-closed (default: blocked) rather than a
+list of writes to catch, because a new write tool you add later should be
+unreachable by default, not silently unblocked until someone remembers to
+list it. And it has to be installed and self-checked <em>before</em> <code>pmagent</code> is
+imported, because a tool module that builds its Jira client at import time
+would otherwise get a client wired to the real, unblocked <code>requests</code>.</p>
+<p><strong>Watch out:</strong> the LLM SDKs call out over <code>httpx</code>, not <code>requests</code>, so model
+calls are unaffected by any of this — you're only ever blocking the app's
+own writes, never the conversation itself. Lucid's MCP client also uses
+<code>httpx</code>, which is why it's disabled outright rather than patched.
 2. <code>cp .env.sample .env</code>, then fill in an LLM key and Jira credentials.
 3. <code>uv run scripts/smoke.py</code> (or <code>--web</code>). Ask about a sprint, ask for a comment,
 press <strong>y</strong>, and watch the <code>[smoke] BLOCKED POST …</code> line prove nothing was
@@ -2637,100 +3610,373 @@ give: 6 exported, 5 included, 2 Done, 2 in active flow, 1 Blocked, 80% of 5
 started, 4 created since the start, 2 resolved since the start.</p>
 </li>
 </ul>
-<ol>
-<li>
-<p><code>➕ docs/learning/examples/sprint_review/analyser.py</code>, which is plain Python
-    with no Strands and no MCP:</p>
+<h3>1. The analyser — plain Python, no Strands, no MCP</h3>
+<h4><code>➕ docs/learning/examples/sprint_review/analyser.py</code> — turns a Jira CSV export into the sprint's numbers, deterministically</h4>
+<p>This is the file the model is never allowed to compute by hand. Same rule as
+<code>pmagent/tools/jira/metrics.py</code>: <strong>the model does judgment, code does
+arithmetic.</strong> Nothing here imports Strands or MCP — it's a pure function you can
+unit-test with a CSV on disk and nothing else.</p>
+<p><strong><code>normalize_status(status: str) -&gt; str</code></strong></p>
 <ul>
-<li><code>normalize_status</code>: the six standard statuses (<code>Done</code>, <code>In review</code>,
- <code>In Progress</code>, <code>Blocked</code>, <code>To Do</code>, <code>Duplicate</code>) matched case-insensitively
- and returned in that spelling. Anything else is trimmed and <strong>kept</strong>.</li>
-<li><code>parse_jira_date</code>: day-first dates (<code>01/Sep/26 9:00 AM</code>, <code>14/09/2026</code>,
- <code>14 Sep 2026</code>, with 12- or 24-hour times), then month-first, then ISO 8601
- (offset dropped). <code>None</code> when it can't parse.</li>
-<li><code>analyse(csv_path, *, sprint_start=None,
- exclude_unfinished_assignee_first_names=(), treat_as_in_progress_issue_keys=())</code>.
- Read the file <strong>once</strong>: hash those bytes, and decode them as <code>utf-8-sig</code> with
- <code>errors="replace"</code>. Required columns are <code>Issue key</code>, <code>Summary</code> and <code>Status</code>;
- <code>Assignee</code>, <code>Created</code> and <code>Resolved</code> are optional. It returns:</li>
+<li><strong>Does:</strong> strips the input; if it case-insensitively matches one of the six
+    standard statuses (<code>Done</code>, <code>In review</code>, <code>In Progress</code>, <code>Blocked</code>, <code>To Do</code>,
+    <code>Duplicate</code>), returns that standard spelling. Otherwise returns the trimmed
+    input <strong>unchanged</strong>.</li>
+<li><strong>Why:</strong> a status your rules don't know about must stay visible under its own
+    name, not get silently folded into a known one.</li>
 </ul>
-<p><code>text
- schema_version  "sprint-review-analysis.v1"      generated_at_utc  ISO timestamp
- source   csv_path, sha256
- filters  sprint_start ("YYYY-MM-DD" or None),
-          excluded_unfinished_assignee_first_names, user_confirmed_in_progress_issue_keys
-            (sorted; the first spelling given is kept),
-          rule = "Exclude matching assignees only when status is not Done; retain their Done cards."
- totals   exported, included, excluded, status_sum
- metrics  status_counts (standard statuses in order, then others case-insensitively),
-          done, active_flow, in_review, in_progress, blocked, to_do, duplicate,
-          started_work, done_or_active_pct_of_started,
-          created_since_sprint_start, done_resolved_since_sprint_start,
-          unreadable_date_issue_keys   (these three are None without a sprint_start)
- evidence included_issues, excluded_issues: one dict per row with key, summary,
-          status, source_normalized_status, normalized_status, assignee, created,
-          resolved, excluded, exclusion_reason, status_adjustment</code></p>
-<p><code>sprint_start</code> is a <code>datetime.date</code> (the server converts the ISO string);
- the date windows are inclusive (<code>&gt;=</code> midnight of the start). An override
- applies only to a card that isn't <code>Done</code> and isn't excluded.
- <code>unreadable_date_issue_keys</code> checks <code>Created</code> on every included card and
- <code>Resolved</code> on <code>Done</code> cards only; a blank date is not unreadable. Unknown statuses are grouped
- case-insensitively under the first spelling seen, then sorted by
- <code>casefold()</code>. <code>CsvError</code> is also raised when <code>status_sum != included</code> (a
- belt-and-braces check). <code>active_flow</code> = In review + In Progress; <code>started_work</code> = Done +
- <code>active_flow</code> + Blocked; <code>done_or_active_pct_of_started</code> = <code>round(100 * (Done
- + active_flow) / started_work)</code> (Python's <code>round</code> is banker's, 62.5 → 62), or
- 0 when nothing has started. <code>status_counts</code> leaves out zero counts. An
- excluded assignee keeps their <code>Done</code> cards; an excluded card can't be
- rescued by an override. <code>exclusion_reason</code> is <code>"Unfinished item assigned to
- excluded first name '&lt;name&gt;'"</code>, with the name as the CSV spells it; <code>status_adjustment</code> is <code>"User-confirmed as In
- Progress for this review."</code>; both <code>""</code> otherwise.
-- <code>CsvError(ValueError)</code>: <code>"CSV is empty: …"</code>, <code>"CSV is missing required
- column(s): …"</code>, <code>"No issue rows found in …"</code>.
-2. <code>➕ docs/learning/examples/sprint_review/server.py</code>, with
-<code>from mcp.server.mcpserver import MCPServer</code>,
-<code>from mcp.server.mcpserver.exceptions import ToolError</code> and
-<code>from mcp.types import ToolAnnotations</code>:
-- <code>RefusedError(ToolError)</code>: a <code>ToolError</code>'s message reaches the model; any
- other exception reaches it only as "Error executing tool …".
-- <code>resolve_csv(root, name)</code>, where <code>root</code> is already resolved: resolve the path
- first (following <code>..</code> and symlinks), then refuse it if it is outside the
- root, not a <code>.csv</code> (any case), or not a file. An <code>OSError</code>/<code>ValueError</code> from
- the path itself is refused as "not a usable file name".
-- <code>list_exports(root)</code>: exactly the names <code>resolve_csv</code> accepts, in subfolders
- too, sorted.
-- <code>run_analysis(root, csv_name, sprint_start=None, …, include_evidence=True)</code>:
- a non-ISO <code>sprint_start</code> is refused with a message containing <code>YYYY-MM-DD</code>; a
- <code>CsvError</code> or <code>csv.Error</code> becomes "can't be analysed", an <code>OSError</code> "can't be
- read"; <code>source.csv_path</code> becomes the root-relative name.
-- <code>save_run(root, run_name, analysis)</code> writes <code>runs/&lt;run_name&gt;/metrics.json</code>
- and returns that relative path. A run name is 1–64 characters of
- <code>[A-Za-z0-9._-]</code>, starting with a letter or digit. The run folder is created
- with <code>mkdir()</code> without <code>exist_ok</code> (atomic), so an existing run is refused
- ("already exists"); a <code>runs</code> that is a symlink or a file is refused ("real
- folder").
-- <code>create_server(root)</code> resolves <code>root</code> once and registers
- <code>list_sprint_exports()</code>; <code>analyze_sprint(csv_name, sprint_start=None,
- exclude_unfinished_assignee_first_names=None,
- treat_as_in_progress_issue_keys=None, include_evidence=True)</code> (annotated
- read-only); and <code>save_metrics(run_name, csv_name, sprint_start=None, …the same
- filters)</code> (annotated as a write), which runs the analysis itself and returns
- <code>{"saved", "sha256", "totals"}</code>. <code>main()</code> parses <code>--root</code>, refuses one that
- isn't a folder, and calls <code>.run()</code>.
- Never <code>print()</code> in the server: stdout is the protocol.
-3. <code>➕ docs/learning/examples/08_sprint_review_mcp.py</code>: copies the sample into a
-temporary root, starts the server with
-<code>StdioServerParameters(command=sys.executable, args=["-m",
-"sprint_review.server", "--root", root], cwd=&lt;the examples folder&gt;)</code>, lists its
-tools, and prints each tool's read-only hint (<code>t.tool_spec["annotations"]
-["readOnlyHint"]</code>; on the mcp object it is <code>.read_only_hint</code>) next to whether
-your gate would gate it (all three: annotations are hints, not trust). It then runs a lane
-agent from <code>make_lane_agent</code> with a scripted model: analyze, save as
-<code>sprint-35</code>, save <code>sprint-35</code> again, then an answer that quotes the server's
-numbers. It approves each pause and prints what came back: two successes, then
-an error saying the run already exists.</p>
-</li>
+<p><strong><code>parse_jira_date(text: str) -&gt; datetime | None</code></strong></p>
+<ul>
+<li><strong>Does:</strong> returns <code>None</code> for a blank string. Otherwise tries, in order: a set
+    of <strong>day-first</strong> formats (<code>01/Sep/26 9:00 AM</code>, <code>14/09/2026</code>, <code>14 Sep 2026</code>,
+    each with an optional 12- or 24-hour time), then the same patterns
+    <strong>month-first</strong> (<code>09/14/2026</code>), then ISO 8601 (dropping any UTC offset —
+    <code>sprint_start</code> is a calendar date, not a timezone-aware instant). Returns
+    <code>None</code> if nothing matches.</li>
+<li><strong>Watch out:</strong> a date that fails to parse is <em>not</em> the same as a blank date —
+    <code>analyse()</code> tracks the two separately (see <code>unreadable_date_issue_keys</code>
+    below).</li>
+</ul>
+<p><strong><code>analyse(csv_path, *, sprint_start=None, exclude_unfinished_assignee_first_names=(), treat_as_in_progress_issue_keys=()) -&gt; dict</code></strong></p>
+<p>Raises <code>CsvError</code> (see below) for anything unusable. Required columns are
+<code>Issue key</code>, <code>Summary</code>, <code>Status</code>; <code>Assignee</code>, <code>Created</code>, <code>Resolved</code> are
+optional and default to <code>""</code> when the column is missing.</p>
+<ul>
+<li>
+<p><strong>Does</strong>, in order:</p>
+<ol>
+<li>Read the file's bytes <strong>once</strong>. These exact bytes are both hashed
+ (SHA-256, for <code>source.sha256</code>) and parsed — never re-read the file a
+ second time for parsing, or the hash no longer matches what was analysed.</li>
+<li>Decode as <code>utf-8-sig</code> with <code>errors="replace"</code> (drops a BOM if present;
+ never crashes on a non-UTF-8 export, e.g. one saved by Excel). Parse as
+ CSV; a row with no fields at all (a blank line) is skipped.</li>
+<li>Check the header row: no header at all → <code>CsvError</code>; missing any of
+ <code>Issue key</code> / <code>Summary</code> / <code>Status</code> → <code>CsvError</code> naming the missing column(s)
+ and listing what <em>was</em> found; a header that's fine but zero data rows
+ following it → <code>CsvError</code>.</li>
+<li>Build a case-insensitive lookup for <code>exclude_unfinished_assignee_first_names</code>
+ and <code>treat_as_in_progress_issue_keys</code>, each keeping the <strong>first spelling</strong>
+ it was given (so <code>"Alex"</code> beats a later <code>"alex"</code> for display purposes,
+ but either matches).</li>
+<li>For every row, build one issue record:
+ - <code>first_name</code> = the first whitespace-separated word of <code>Assignee</code>, or
+   <code>""</code> if <code>Assignee</code> is blank.
+ - <code>source_normalized_status</code> = <code>normalize_status(Status)</code>.
+ - <code>excluded</code> = true only when the status <strong>isn't</strong> <code>Done</code> <strong>and</strong>
+   <code>first_name</code> (case-insensitively) is in the excluded set.
+ - <code>override</code> = true only when the row <strong>isn't</strong> excluded, <strong>isn't</strong>
+   <code>Done</code>, and its key (case-insensitively) is in the confirmed-in-progress
+   set.
+ - <code>normalized_status</code> = <code>"In Progress"</code> when overridden, else
+   <code>source_normalized_status</code>.
+ - Record <code>exclusion_reason</code> = <code>"Unfinished item assigned to excluded first
+   name '&lt;first_name&gt;'"</code> when excluded, else <code>""</code>; <code>status_adjustment</code> =
+   <code>"User-confirmed as In Progress for this review."</code> when overridden, else
+   <code>""</code>.</li>
+<li>Split the records into <code>included</code> (not excluded) and <code>excluded_issues</code>.</li>
+<li>Count <code>included</code> by <code>normalized_status</code>. Build <code>status_counts</code> as: the
+ six standard statuses <strong>in their fixed order</strong>, each included only if its
+ count is nonzero, followed by every non-standard status — grouped
+ case-insensitively under the first spelling seen, counts summed, then
+ those groups sorted by <code>casefold()</code>.</li>
+<li>From the counts: <code>active_flow</code> = In review + In Progress;
+ <code>started_work</code> = Done + <code>active_flow</code> + Blocked; and
+ <code>done_or_active_pct_of_started</code> = <code>round(100 * (Done + active_flow) /
+ started_work)</code> when <code>started_work &gt; 0</code>, else <code>0</code>. <code>round()</code> here is
+ Python's banker's rounding (<code>62.5</code> rounds to <code>62</code>, not <code>63</code>) — don't
+ replace it with a "round half up" helper, the test table checks this
+ exact case.</li>
+<li>Only when <code>sprint_start</code> is given (a <code>date</code>, midnight of that day is the
+ window's start, inclusive): for every <strong>included</strong> issue, parse its
+ <code>Created</code> date, and — only for issues whose <code>normalized_status</code> is
+ <code>Done</code> — its <code>Resolved</code> date. Count how many parsed <code>Created</code>/<code>Resolved</code>
+ dates fall on or after the window start
+ (<code>created_since_sprint_start</code> / <code>done_resolved_since_sprint_start</code>).
+ Separately, collect into <code>unreadable_date_issue_keys</code> any issue whose
+ <code>Created</code> field was <strong>non-blank but unparseable</strong>, or (for <code>Done</code> issues
+ only) whose <code>Resolved</code> field was non-blank but unparseable. A <em>blank</em>
+ date field is not an error and is not listed. When <code>sprint_start</code> is
+ omitted, all three of these fields are <code>None</code>.</li>
+<li>Assemble the result (shape below), then re-check that <code>status_sum</code>
+  (the sum of <code>status_counts</code>) equals <code>included</code>'s count, raising
+  <code>CsvError</code> if it doesn't. This can't currently fire — <code>status_counts</code> is
+  built from <code>included</code> itself — but it stays as a belt-and-braces guard
+  against a future refactor breaking that invariant silently.</li>
 </ol>
+</li>
+<li>
+<p><strong>Return shape</strong> — a dict with schema <code>"sprint-review-analysis.v1"</code>:</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>schema_version</code></td>
+<td>the literal string <code>"sprint-review-analysis.v1"</code></td>
+</tr>
+<tr>
+<td><code>generated_at_utc</code></td>
+<td><code>datetime.now(timezone.utc).isoformat()</code></td>
+</tr>
+<tr>
+<td><code>source.csv_path</code></td>
+<td>the resolved, absolute path given to <code>analyse()</code> (the server, in step 2, overwrites this with a root-relative name before it ever reaches a model)</td>
+</tr>
+<tr>
+<td><code>source.sha256</code></td>
+<td>SHA-256 of the exact bytes read in step 1</td>
+</tr>
+<tr>
+<td><code>filters.sprint_start</code></td>
+<td>the given date as <code>"YYYY-MM-DD"</code>, or <code>None</code></td>
+</tr>
+<tr>
+<td><code>filters.excluded_unfinished_assignee_first_names</code></td>
+<td>the excluded names, deduplicated case-insensitively, sorted by <code>casefold()</code></td>
+</tr>
+<tr>
+<td><code>filters.user_confirmed_in_progress_issue_keys</code></td>
+<td>same, for the override keys</td>
+</tr>
+<tr>
+<td><code>filters.rule</code></td>
+<td>the fixed string <code>"Exclude matching assignees only when status is not Done; retain their Done cards."</code></td>
+</tr>
+<tr>
+<td><code>totals.exported</code></td>
+<td>every row read</td>
+</tr>
+<tr>
+<td><code>totals.included</code></td>
+<td>rows not excluded</td>
+</tr>
+<tr>
+<td><code>totals.excluded</code></td>
+<td>rows excluded</td>
+</tr>
+<tr>
+<td><code>totals.status_sum</code></td>
+<td>sum of <code>metrics.status_counts</code> (must equal <code>totals.included</code>)</td>
+</tr>
+<tr>
+<td><code>metrics.status_counts</code></td>
+<td>see step 7</td>
+</tr>
+<tr>
+<td><code>metrics.done</code> / <code>.in_review</code> / <code>.in_progress</code> / <code>.blocked</code> / <code>.to_do</code> / <code>.duplicate</code></td>
+<td>the six standard counts (0 if a status never appears)</td>
+</tr>
+<tr>
+<td><code>metrics.active_flow</code> / <code>.started_work</code> / <code>.done_or_active_pct_of_started</code></td>
+<td>see step 8</td>
+</tr>
+<tr>
+<td><code>metrics.created_since_sprint_start</code> / <code>.done_resolved_since_sprint_start</code> / <code>.unreadable_date_issue_keys</code></td>
+<td>see step 9; all three <code>None</code> without a <code>sprint_start</code></td>
+</tr>
+<tr>
+<td><code>evidence.included_issues</code> / <code>.excluded_issues</code></td>
+<td>one record per row (the shape built in step 5), for citing a specific card</td>
+</tr>
+</tbody>
+</table></div>
+</li>
+</ul>
+<p><strong><code>CsvError(ValueError)</code></strong> — raised, with these exact messages, for:</p>
+<ul>
+<li>an empty file: <code>"CSV is empty: &lt;name&gt;"</code></li>
+<li>missing required columns: <code>"CSV is missing required column(s): &lt;names&gt;. Found: &lt;headers&gt;"</code></li>
+<li>a header with no data rows: <code>"No issue rows found in &lt;name&gt;"</code></li>
+<li>the reconciliation check in step 10 (a message naming both counts)</li>
+</ul>
+<h3>2. The server — the guards a host can't be trusted to provide</h3>
+<h4><code>➕ docs/learning/examples/sprint_review/server.py</code> — wraps <code>analyse()</code> as three MCP tools, with the safety fixes a real design review found missing</h4>
+<p>Import <code>MCPServer</code> from <code>mcp.server.mcpserver</code>, <code>ToolError</code> from
+<code>mcp.server.mcpserver.exceptions</code>, and <code>ToolAnnotations</code> from <code>mcp.types</code>. The
+two things this server exists to fix, that a plain wrapper around <code>analyse()</code>
+would not: <strong>a host could ask for a CSV outside the folder it was given</strong>, and
+<strong>a second save could silently overwrite the first one's numbers</strong>. Both guards
+live <em>in the server</em>, because a server can't assume its host — or its host's
+model — will be careful.</p>
+<p><strong><code>RefusedError(ToolError)</code></strong></p>
+<ul>
+<li><strong>Does:</strong> nothing beyond what <code>ToolError</code> does — it exists so every refusal
+    in this file raises the <em>same</em> exception type.</li>
+<li><strong>Why:</strong> an MCP <code>ToolError</code>'s message is sent back to the model as a normal
+    (if failed) tool result — the model can read it, explain it, or try
+    something else. Any exception that is <em>not</em> a <code>ToolError</code> is treated as a
+    crash: the model sees only <code>"Error executing tool &lt;name&gt;"</code>, and the real
+    reason stays in the server's own log. Every guard below deliberately raises
+    <code>RefusedError</code>, never a bare <code>ValueError</code> or <code>OSError</code>.</li>
+</ul>
+<p>Every helper below receives <code>root</code> <strong>already resolved</strong> — <code>create_server</code>
+resolves it exactly once, so every containment check compares two resolved
+paths, never a resolved path against a raw one.</p>
+<p><strong><code>resolve_csv(root: Path, csv_name: str) -&gt; Path</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Resolve <code>root / csv_name</code> (this follows both <code>..</code> segments and symlinks).</li>
+<li>If that resolution itself raises <code>OSError</code> or <code>ValueError</code> (a NUL byte in
+ the name, a path too long, a symlink loop) → refuse: <em>"not a usable file
+ name"</em>.</li>
+<li>If the resolved path is not <code>.is_relative_to(root)</code> → refuse: <em>"outside
+ the sprint export folder"</em>.</li>
+<li>If its suffix isn't <code>.csv</code> (case-insensitive) → refuse: <em>"not a .csv
+ file"</em>.</li>
+<li>If it doesn't exist as a file → refuse: <em>"No CSV named '<name>' in the
+ sprint export folder"</em>.</li>
+</ol>
+</li>
+<li><strong>Why:</strong> resolving the path <em>before</em> comparing it to <code>root</code> is what catches a
+    symlink that points outside the folder — comparing the raw, unresolved
+    string would miss it completely.</li>
+</ul>
+<p><strong><code>list_exports(root: Path) -&gt; list[str]</code></strong></p>
+<ul>
+<li><strong>Does:</strong> walks every path under <code>root</code> recursively (subfolders included),
+    sorted; keeps only the ones <code>resolve_csv</code> would accept; returns them as
+    root-relative, forward-slash names.</li>
+<li><strong>Why:</strong> by reusing <code>resolve_csv</code> instead of its own filter, "what gets
+    listed" and "what gets accepted" can never drift apart.</li>
+</ul>
+<p><strong><code>run_analysis(root, csv_name, sprint_start=None, exclude_unfinished_assignee_first_names=None, treat_as_in_progress_issue_keys=None, include_evidence=True) -&gt; dict</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li><code>resolve_csv(root, csv_name)</code> — any of the refusals above can end this
+ call here.</li>
+<li>Parse <code>sprint_start</code> (a string) as an ISO date; a value that isn't
+ <code>YYYY-MM-DD</code> → refuse, with a message naming that format.</li>
+<li>Call <code>analyser.analyse(...)</code> with the resolved path and the filters.</li>
+<li>Translate the analyser's own failures at this boundary: a <code>CsvError</code> or
+ <code>csv.Error</code> → refuse <em>"'<name>' can't be analysed: <reason>"</em>; an
+ <code>OSError</code> (e.g. unreadable by the server's own user) → refuse <em>"'<name>'
+ can't be read: <reason>"</em>.</li>
+<li>Overwrite <code>result["source"]["csv_path"]</code> with the <strong>root-relative</strong> name
+ before returning — the absolute path on the server's machine must never
+ reach the model.</li>
+<li>When <code>include_evidence</code> is <code>False</code>, drop the <code>"evidence"</code> key entirely.</li>
+</ol>
+</li>
+<li><strong>Why:</strong> this function is the seam between "framework-free arithmetic"
+    (<code>analyse()</code>) and "MCP-shaped refusals" (<code>RefusedError</code>) — the analyser
+    itself never needs to know it's being called from a server.</li>
+</ul>
+<p><strong><code>save_run(root: Path, run_name: str, analysis: dict) -&gt; str</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Validate <code>run_name</code>: 1–64 characters of letters, digits, <code>.</code>, <code>_</code>, <code>-</code>,
+ starting with a letter or digit. Anything else → refuse.</li>
+<li>Ensure <code>root / "runs"</code> exists (<code>mkdir(exist_ok=True)</code>), then confirm it
+ resolves to itself — i.e. it is a real folder, not a symlink pointing
+ elsewhere. Either failing → refuse: <em>"runs/ must be a real folder inside
+ the sprint export folder"</em>.</li>
+<li>Create <code>runs/&lt;run_name&gt;/</code> with a plain <code>mkdir()</code> — <strong>no</strong> <code>exist_ok</code>.</li>
+<li>If that folder already exists, <code>mkdir()</code> raises <code>FileExistsError</code> →
+ refuse: <em>"Run '<run_name>' already exists. Choose a new run name; an
+ existing review is never overwritten."</em></li>
+<li>Write <code>metrics.json</code> inside it (<code>json.dumps(analysis, indent=2)</code> plus a
+ trailing newline, UTF-8) and return its path relative to <code>root</code>.</li>
+</ol>
+</li>
+<li><strong>Why the plain <code>mkdir()</code> matters:</strong> the "never overwrite" guarantee isn't
+    an <code>if folder.exists(): refuse</code> check — that would race a second call
+    arriving at nearly the same time. A bare <code>mkdir()</code> is atomic: the filesystem
+    itself guarantees only one caller can win the race, and every other caller
+    gets <code>FileExistsError</code>.</li>
+</ul>
+<p><strong><code>create_server(root: Path) -&gt; MCPServer</code></strong></p>
+<ul>
+<li><strong>Does:</strong><ol>
+<li>Resolve <code>root</code> once.</li>
+<li>Build an <code>MCPServer</code>, and register three tools on it:
+ - <code>list_sprint_exports()</code> — no arguments, returns <code>list_exports(root)</code>,
+   annotated <code>readOnlyHint=True</code>.
+ - <code>analyze_sprint(csv_name, sprint_start=None,
+   exclude_unfinished_assignee_first_names=None,
+   treat_as_in_progress_issue_keys=None, include_evidence=True)</code> — returns
+   <code>run_analysis(...)</code> directly, also annotated <code>readOnlyHint=True</code>.
+ - <code>save_metrics(run_name, csv_name, sprint_start=None,
+   exclude_unfinished_assignee_first_names=None,
+   treat_as_in_progress_issue_keys=None)</code> — runs the analysis itself (with
+   evidence included), then <code>save_run(...)</code>, and returns just
+   <code>{"saved": &lt;path&gt;, "sha256": ..., "totals": ...}</code>. Annotated as a write
+   (<code>readOnlyHint=False</code>, plus <code>destructiveHint=False</code>,
+   <code>idempotentHint=False</code>).</li>
+</ol>
+</li>
+<li><strong>Why the docstrings matter:</strong> exactly as in lesson 2, a tool's docstring is
+    what the model reads to decide when and how to call it — write each one to
+    explain the filters and what the tool returns, the same discipline as any
+    local <code>@tool</code>.</li>
+<li><strong>Watch out:</strong> never call <code>print()</code> anywhere in this file's request path.
+    For a stdio server, <strong>stdout is the protocol</strong> — anything printed there
+    corrupts the next message. If you need visibility while debugging, write to
+    stderr; the client in step 3 passes the server's stderr straight through to
+    your terminal.</li>
+</ul>
+<p><strong><code>main()</code></strong></p>
+<ul>
+<li><strong>Does:</strong> parses one required argument, <code>--root</code>; if it isn't an existing
+    directory, prints a usage error and exits (via <code>argparse</code>'s own
+    <code>parser.error</code>) instead of raising; otherwise calls
+    <code>create_server(root).run()</code>, which blocks, serving over stdio.</li>
+</ul>
+<h3>3. The client — talking to your own server through the real gate</h3>
+<h4><code>➕ docs/learning/examples/08_sprint_review_mcp.py</code> — starts the server as a subprocess, and runs it through a real lane agent</h4>
+<p>This is the other half of lesson 8: R2 only ever <em>consumed</em> someone else's
+server. Here the same <code>make_lane_agent</code> from R4 is pointed at a server you
+just wrote, so the approval gate runs for real against tools nobody but you
+has reviewed.</p>
+<ul>
+<li><strong>Does</strong>, in order:<ol>
+<li>Copy <code>sample-jira.csv</code> into a fresh temporary directory — this becomes
+ the server's <code>--root</code>, and is deleted at the end regardless of outcome.</li>
+<li>Build an <code>MCPClient</code> whose transport is
+ <code>stdio_client(StdioServerParameters(command=sys.executable, args=["-m",
+ "sprint_review.server", "--root", &lt;temp root&gt;], cwd=&lt;examples folder&gt;))</code>
+ — the server runs as a <strong>separate Python process</strong>, talking over
+ stdin/stdout.</li>
+<li><code>client.start()</code>, then <code>client.list_tools_sync()</code>. One call is enough
+ here (only 3 tools) — unlike <code>mcp_tools.py</code>'s <code>_list_all_tools</code>, there's
+ no need to follow a pagination token.</li>
+<li>Build a lane agent with <code>make_lane_agent</code>, passing it the discovered
+ tools and a scripted model whose script is: call <code>analyze_sprint</code> (with
+ <code>include_evidence=False</code>), call <code>save_metrics</code> as run <code>"sprint-35"</code>,
+ call <code>save_metrics</code> as <code>"sprint-35"</code> <strong>again</strong> (the same name, on
+ purpose — this is what exercises the refusal), then a final text turn
+ that reads the real numbers back out of the <em>first</em> tool result (the
+ <code>analyze_sprint</code> call) and quotes them — it never invents or recomputes
+ a figure.</li>
+<li>Before running the agent: for every discovered tool, print its name, the
+ read-only hint the <strong>server</strong> declared
+ (<code>tool.tool_spec["annotations"]["readOnlyHint"]</code>), and whether <strong>your</strong>
+ gate actually pauses on it (<code>requires_approval(tool_name, agent)</code>) —
+ side by side.</li>
+<li>Run the agent on the prompt; while <code>stop_reason == "interrupt"</code>,
+ auto-approve every pending call (safe here — the server can only touch
+ the throwaway temp folder) and continue.</li>
+<li>Print each tool result's status and a preview of its text, the files the
+ server actually wrote under the temp root, and the model's final
+ answer.</li>
+<li>In a <code>finally</code>: stop the client, then remove the temp directory.</li>
+</ol>
+</li>
+<li><strong>Why the side-by-side print matters:</strong> this is the concrete demonstration
+    of lesson 8's rule. <code>list_sprint_exports</code> and <code>analyze_sprint</code> are both
+    declared read-only by the server, but all three tools — including those two
+    — still print <code>gated=True</code>, because nothing is in
+    <code>pmagent/tools/mcp_tools.py::APPROVED_READ_TOOLS</code> yet. <strong>Annotations are a
+    hint from the server; only a human adding a name to that frozenset makes a
+    discovered tool free.</strong></li>
+<li><strong>Watch out:</strong> the second <code>save_metrics</code> call is <em>expected</em> to come back as
+    an error result ("already exists") — that's the point of calling it twice,
+    not a bug to fix.</li>
+</ul>
 <p><strong>Your tests (<code>➕ tests/test_sprint_review.py</code>) must cover:</strong> the sample's eight
 figures above; excluding an assignee drops only their unfinished cards; no filters
 include every row, with no date metrics; unknown statuses kept, counted, listed
@@ -2751,48 +3997,84 @@ and see which tests catch the overwrite.</p>
 <h2>R10 — Package it: the Docker image (2–3 h)</h2>
 <p>The project ships as one Docker image, and the image is where "offline first"
 and "never bake in a secret" become mechanical. You need R7, R8 and R9.</p>
+<h4><code>➕ scripts/container.py</code> — the image's one entrypoint, so every way to run the project is a name, not a memorized command line</h4>
+<p><strong>Does:</strong> <code>command(argv) -&gt; (args, cwd)</code> turns the first CLI argument into a program to <code>exec</code> and the folder to run it from:</p>
+<div class="scroll"><table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Runs</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>demo</code> (default)</td>
+<td><code>scripts/demo_web.py --host 0.0.0.0 --port $PORT</code></td>
+<td>the offline demo; safe to bind wide open (see <strong>Why</strong>)</td>
+</tr>
+<tr>
+<td><code>web</code></td>
+<td><code>web.py</code> with <code>_web_flags()</code> (below)</td>
+<td>the real web UI</td>
+</tr>
+<tr>
+<td><code>smoke-web</code></td>
+<td><code>scripts/smoke.py --web</code> plus <code>_web_flags()</code></td>
+<td>web UI, writes blocked</td>
+</tr>
+<tr>
+<td><code>cli</code></td>
+<td><code>main.py</code></td>
+<td>the real CLI</td>
+</tr>
+<tr>
+<td><code>smoke</code></td>
+<td><code>scripts/smoke.py</code></td>
+<td>CLI, writes blocked</td>
+</tr>
+<tr>
+<td><code>sprint-review-mcp</code></td>
+<td><code>python -m sprint_review.server --root $SPRINT_REVIEW_ROOT</code>, cwd = the examples folder</td>
+<td>R9's server over stdio</td>
+</tr>
+<tr>
+<td>anything else</td>
+<td>exec'd exactly as given (e.g. <code>bash</code>)</td>
+<td>lets you shell into the image for debugging</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>_web_flags()</code> always passes <code>--host 0.0.0.0 --port $PORT</code>, plus <code>--allowed-host localhost</code> and one more <code>--allowed-host</code> per name in <code>PMAGENT_ALLOWED_HOSTS</code> (comma-separated). Extra arguments after the name are appended as given (<code>docker run po-agent web --allowed-host pm.example.com</code>).</p>
+<p><code>examples</code> is handled separately, in <code>main()</code>: it runs every file <code>docs/learning/examples/[0-9]*.py</code>, except any name listed in <code>NEEDS_EXTRAS</code> (examples needing a package the image doesn't install — in your rebuild that set can be empty), and exits non-zero if any of them fails.</p>
+<p><code>main(argv)</code>:</p>
 <ol>
-<li><code>➕ scripts/container.py</code>, the entrypoint. <code>command(argv)</code> maps a name to
-    <code>(program + args, working folder)</code>:<ul>
-<li><code>demo</code> (the default) runs the offline demo on <code>0.0.0.0</code>. A container's
- <code>127.0.0.1</code> can't be reached from the host, and the demo holds no
- credentials, so this is safe.</li>
-<li><code>web</code> and <code>smoke-web</code> run <code>web.py</code> on <code>0.0.0.0</code> with <code>--allowed-host
- localhost</code>, plus any names in <code>PMAGENT_ALLOWED_HOSTS</code> (comma-separated).
- <code>web.py</code>'s own rule still applies: no <code>PMAGENT_API_TOKEN</code>, no start.</li>
-<li><code>cli</code> and <code>smoke</code> run the CLI.</li>
-<li><code>sprint-review-mcp</code> runs R9's server over stdio, with its root at
- <code>SPRINT_REVIEW_ROOT</code> (default <code>data/sprint-review</code> in the project), creating
- the folder first.</li>
-<li><code>examples</code> (handled in <code>main()</code> rather than <code>command()</code>) runs every
- numbered example except those in <code>NEEDS_EXTRAS</code> (examples that need extra
- packages; in your rebuild that set can be empty), and exits non-zero if any
- fails.</li>
-<li>Anything else is exec'd as given. <code>main()</code> <code>exec</code>s the command, so it
- receives <code>docker stop</code>'s signal; if no such program exists (the exec raises
- <code>FileNotFoundError</code>), it exits with <code>Unknown command '&lt;x&gt;'. Commands: …</code>
- instead of a traceback.</li>
-<li><code>APP</code> is the project folder, derived from <code>__file__</code> (never a hard-coded
- <code>/app</code>, because your tests run it from your checkout); <code>PORT</code> comes from the
- environment, default <code>8000</code>.</li>
-</ul>
-</li>
-<li><code>➕ .dockerignore</code> is an <strong>allowlist</strong>: <code>*</code> first, then <code>!</code> for each path the
-    image needs (<code>pyproject.toml</code>, <code>uv.lock</code>, <code>.python-version</code>, <code>main.py</code>,
-    <code>web.py</code>, <code>pmagent/</code>, the scripts the entrypoint runs, the examples folder, and
-    the scripted model in <code>tests/</code>), then <code>**/__pycache__/</code> and <code>**/*.py[cod]</code>. A denylist would let
-    the next file someone drops in the folder, <code>.env</code> or a zip of real data, into
-    the image.</li>
-<li><code>➕ Dockerfile</code>, in two stages. The build stage copies <code>uv</code> from its official
-    image and runs <code>uv sync --locked --no-dev</code> from the lock file alone, then copies
-    the app. The final stage creates a non-root user; the code stays root-owned
-    (read-only); only <code>/app/data</code> is writable, and <code>HOME</code> points into it. There is
-    no <code>VOLUME</code> line (it would leave an anonymous volume behind every run).
-    <code>ENTRYPOINT ["python", "scripts/container.py"]</code>, <code>CMD ["demo"]</code>, and
-    <code>ARG PYTHON_VERSION</code> matches <code>.python-version</code>.</li>
-<li><code>➕ compose.yaml</code> (optional): a <code>demo</code> service, and a <code>web</code> service under a
-    <code>live</code> profile with <code>env_file: .env</code>, a named data volume and a health check.</li>
+<li>if the command is <code>examples</code>, run them and exit — nothing below runs.</li>
+<li>otherwise compute <code>(args, cwd)</code> from <code>command(argv)</code>.</li>
+<li>if the command is <code>sprint-review-mcp</code>, create <code>SPRINT_REVIEW_ROOT</code> first — a fresh bind mount or volume won't have the folder yet.</li>
+<li><code>os.chdir(cwd)</code>, then <code>os.execvp(args[0], args)</code> — this <em>replaces</em> the Python process with the target program; it does not spawn a child.</li>
+<li>if <code>execvp</code> raises <code>FileNotFoundError</code> (no such program), exit with <code>Unknown command '&lt;x&gt;'. Commands: …</code> instead of a traceback.</li>
 </ol>
+<p><code>APP</code> is <code>Path(__file__).resolve().parent.parent</code> — the project root, computed from where this file actually lives, never hard-coded to <code>/app</code>. <code>PORT</code> comes from the environment, default <code>8000</code>.</p>
+<p><strong>Why exec, not <code>subprocess.run</code>:</strong> <code>docker stop</code> sends its signal to PID 1 in the container. <code>execvp</code> replaces <code>container.py</code> with the target program <em>in the same process</em>, so that program becomes PID 1 and receives the signal directly. <code>subprocess.run</code> would leave <code>container.py</code> as PID 1 and the real program as an unsignalled child. (Run the container with <code>--init</code>, or compose's <code>init: true</code>, so a real init process still reaps zombies — <code>exec</code> alone doesn't give you that.)</p>
+<p><strong>Why <code>0.0.0.0</code> is safe for <code>demo</code> but not for <code>web</code>:</strong> inside a container, <code>127.0.0.1</code> is the container's <em>own</em> loopback — the host can't reach it at all, so the demo (and <code>smoke-web</code>) must bind <code>0.0.0.0</code> to be reachable. <code>web.py</code>'s own rule from R7 still applies on top of that: a non-loopback bind refuses to start without <code>PMAGENT_API_TOKEN</code>, and only names in the <code>--allowed-host</code> list are accepted as <code>Host:</code>. The demo carries no credentials, so binding it wide open has nothing to protect; <code>web</code> does, so its rule still stands even inside the container.</p>
+<h4><code>➕ .dockerignore</code> — decides what's in the build context at all</h4>
+<p><strong>Contains:</strong> the opposite of the usual pattern. Instead of listing what to exclude, start with <code>*</code> (exclude everything), then add back one <code>!path</code> line per thing the image actually needs: <code>pyproject.toml</code>, <code>uv.lock</code>, <code>.python-version</code>, <code>README.md</code>, <code>.env.sample</code>, <code>main.py</code>, <code>web.py</code>, <code>pmagent/</code>, the handful of scripts the entrypoint runs (<code>scripts/__init__.py</code>, <code>scripts/container.py</code>, <code>scripts/demo_web.py</code>, <code>scripts/smoke.py</code>), <code>docs/learning/examples/</code> (the course examples, including R9's server), and <code>tests/__init__.py</code> + <code>tests/fakes.py</code> (the scripted model, since the demo and the examples replay through it). Then re-exclude <code>**/__pycache__/</code> and <code>**/*.py[cod]</code> even inside the paths just added back, plus two real-data paths under <code>pmagent/tools/fy_budget/</code> (fixtures and a provenance note) that must never be in an image.</p>
+<p><strong>Why an allowlist, not a denylist:</strong> a denylist (<code>.env</code>, <code>data/</code>, <code>*.zip</code>, …) only blocks what someone thought to list. The first time a teammate drops a real Jira export, a <code>.env.local</code>, or a zip of a deck into the project folder, a denylist lets it straight into the image unless someone remembers to add a new rule. An allowlist can't make that mistake: a new file is excluded by default, and adding a legitimate new file to the image is a deliberate, reviewable one-line change.</p>
+<h4><code>➕ Dockerfile</code> — two stages: resolve dependencies, then run as a non-root user</h4>
+<p><strong>Contains, in order:</strong></p>
+<ol>
+<li><code>ARG PYTHON_VERSION</code> (matching <code>.python-version</code>) picks the base image tag for both stages.</li>
+<li><strong>Build stage</strong> (<code>FROM python:${PYTHON_VERSION}-slim AS build</code>): copy the <code>uv</code> binary in from its own official image (not installed via pip), then <code>uv sync --locked --no-dev</code> using only <code>uv.lock</code> and <code>pyproject.toml</code> — copied in as their own layer, before the rest of the app — so editing application code doesn't invalidate the dependency-install layer. <code>--locked</code> fails the build outright if <code>uv.lock</code> is out of date. Only after that does <code>COPY . /app</code> bring in the rest of the source (filtered by <code>.dockerignore</code>).</li>
+<li><strong>Final stage</strong> (<code>FROM python:${PYTHON_VERSION}-slim</code>, no build tools): create a non-root user, copy the already-built <code>/app</code> from the build stage, create the writable subfolders under <code>data/</code> (FY budget input/output, sprint-review, and a <code>home/</code> used for <code>HOME</code>) and <code>chown</code> only <code>data/</code> to that user, then <code>USER app</code>. The application code itself stays owned by root and is read-only to the app user; only <code>/app/data</code> is writable.</li>
+<li><code>ENTRYPOINT ["python", "scripts/container.py"]</code> and <code>CMD ["demo"]</code> — the entrypoint script above, defaulting to the safe offline demo if no command is given.</li>
+<li>No <code>VOLUME</code> line.</li>
+</ol>
+<p><strong>Why the app user only owns <code>data/</code>:</strong> the whole point of a read-only application image is that nothing running inside it can modify its own code. <code>data/</code> is the one place with a legitimate reason to write: FY budget files, R9's sprint-review exports and saved runs, and (via <code>HOME=/app/data/home</code>) the spreadsheet lane's token cache.</p>
+<p><strong>Why no <code>VOLUME</code> line:</strong> a <code>VOLUME</code> instruction makes Docker create an <em>anonymous</em> volume automatically on every <code>docker run</code> that doesn't otherwise mount something there — one you didn't name and will forget to clean up. Naming your own volume explicitly at run time (<code>-v po-agent-data:/app/data</code>) gives you a volume you can find, back up, or delete on purpose, so the Dockerfile leaves this to the caller instead.</p>
+<h4><code>➕ compose.yaml</code> (optional) — the two run modes as <code>docker compose</code> services</h4>
+<p><strong>Contains:</strong> a <code>demo</code> service with no profile (so <code>docker compose up demo</code> just works, no <code>.env</code> needed) exposing <code>127.0.0.1:8000:8000</code>, and a <code>web</code> service gated behind a <code>live</code> profile (<code>docker compose --profile live up web</code>) that adds <code>env_file: .env</code>, a named data volume (<code>po-agent-data:/app/data</code>), and a health check that hits <code>/api/v1/health</code> from inside the container.</p>
+<p><strong>Watch out:</strong> the <code>web</code> service's comment is a reminder, not an enforced check — <code>.env</code> must set <code>PMAGENT_API_TOKEN</code>, because <code>web.py</code> still refuses a non-loopback bind without one, <code>compose.yaml</code> or not.</p>
 <p><strong>Your tests (<code>➕ tests/test_docker.py</code>) must cover:</strong> the app's files are in the
 build context and <code>.env</code>, <code>data/</code>, zips, tests other than the scripted model and
 stray files are not (implement Docker's rule: the last matching pattern wins, <code>*</code>

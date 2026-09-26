@@ -34,7 +34,7 @@ from pmagent import env
 T = TypeVar("T", bound=BaseModel)
 
 @cache
-def get_modol() -> Model:
+def get_model() -> Model:
     return build_model()
 
 
@@ -59,4 +59,100 @@ def build_model() -> Model:
     """
 
     if env.LLM_PROVIDER == "anthropic":
-        
+        from strands.models.anthropic import AnthropicModel
+
+        return AnthropicModel(
+            client_args={"api_key":env.ANTHROPIC_API_KEY},
+            model_id=env.LLM_MODEL,
+            max_tokens=env.LLM_MAX_TOKENS
+        )
+
+    if env.LLM_PROVIDER == "openai":
+        effort = env.LLM_REASONING_EFFORT
+        client_args = {"api_key":env.OPENAI_API_KEY}
+
+        if effort == "none":
+            from strands.models.openai import OpenAIModel
+            # gpt-5.x rejects function tools on /v1/chat/completions unless
+            # reasoning is explicitly off (verified: HTTP 400 "Function tools with
+            # reasoning_effort are not supported ..."). Every lane has tools, and
+            # Strands' structured output is itself a tool, so this is mandatory.
+            # Sending reasoning_effort also re-enables temperature on gpt-5.
+            # Do not add max_tokens: gpt-5 rejects it on this endpoint.
+            return OpenAIModel(
+                client_args=client_args,
+                model_id=env.LLM_MODEL,
+                params={"reasoning_effort": "none", "temperature": 0.1},
+            )
+
+        from strands.models.openai_responses import OpenAIResponsesModel
+        reasoning = {"effort": effort}
+        if env.LLM_REASONING_SUMMARY:
+            # Streams as `reasoningText` through Strands' callback handler —
+            # the web UI's thinking chain shows it (verified live on gpt-5.6-luna
+            # with effort=medium, summary=detailed).
+            reasoning["summary"] = env.LLM_REASONING_SUMMARY
+        return OpenAIResponsesModel(
+            client_args=client_args,
+            model_id=env.LLM_MODEL,
+            params={"reasoning": reasoning},
+        )
+    raise ValueError(
+        f"Unknown LLM_PROVIDER={env.LLM_PROVIDER!r}. Use 'anthropic' or 'openai'."
+    )
+
+
+
+def structured(
+        schema: type[T],
+        prompt: str,
+        system_prompt: str|None = None,
+        model: Model | None = None,
+        usage_sink: Callable[[dict],None] |None = None
+) -> T:
+    """Ask the model for one instance of `schema`. Stateless: one prompt in, one object out.
+
+    STRANDS CONCEPT — structured output. Passing `structured_output_model=` to an
+    agent call makes Strands give the model a hidden tool whose input schema is
+    the Pydantic model, and validate what comes back (retrying on a validation
+    error). The parsed object is on `result.structured_output`.
+
+    A *fresh* Agent is built on every call, on purpose:
+      - `callback_handler=None` — the default handler prints the model's stream
+        to stdout, which would dump raw structured-output tool calls into the CLI.
+      - a new, empty message list — the router, PRD writer/reviewer and diagram
+        brief are all stateless jobs, and their hidden tool traffic must never
+        leak into the conversation the user is having with the lanes.
+      - no hooks — in particular no approval gate: there is nothing to approve.
+
+    `usage_sink`, if given, receives this call's token usage
+    (`result.metrics.latest_agent_invocation.usage`) — how the web UI counts
+    every model call in a turn, including these hidden ones.
+
+    LangGraph original: `get_llm().with_structured_output(Schema).invoke(...)`.
+    """
+    agent = Agent(
+        model = model or get_model(),
+        system_prompt=system_prompt,
+        messages = [],
+        callback_handler= None,
+    )
+    result = agent(prompt,structured_output_model=schema)
+    if usage_sink is not None:
+        usage_sink(invocation_usage(result))
+    return result.structured_output
+
+def invocation_usage(result) -> dict:
+    """Token usage of the agent invocation that produced `result`.
+
+    `result.metrics.accumulated_usage` is cumulative over the agent's whole life;
+    the per-call figure is on the latest `AgentInvocation`.
+    """
+    invocation = result.metrics.latest_agent_invocation
+    usage = dict(invocation.usage) if invocation else {}
+    return {
+        "input_tokens": usage.get("inputTokens", 0),
+        "output_tokens": usage.get("outputTokens", 0),
+        "total_tokens": usage.get("totalTokens", 0),
+        "model_calls": len(invocation.cycles) if invocation else 0,
+    }
