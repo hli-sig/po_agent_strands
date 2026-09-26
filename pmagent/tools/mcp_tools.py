@@ -39,6 +39,7 @@ from pmagent import env
 # every Lucid tool (search, create_diagram, share, ...) goes through the gate.
 APPROVED_READ_TOOLS: frozenset[str] = frozenset()
 
+
 @dataclass
 class MCPSession:
     """A started MCP client plus the tools it exposes."""
@@ -52,8 +53,45 @@ class MCPSession:
 
 
 def _list_all_tools(client) -> list:
-    """list_tools_sync` is paginated; follow the token to the end."""
+    """`list_tools_sync` is paginated; follow the token to the end."""
     tools: list = []
     token = None
     while True:
-        
+        page = client.list_tools_sync(pagination_token=token)
+        tools.extend(page)
+        token = page.pagination_token
+        if token is None:
+            return tools
+
+
+def start_lucid() -> MCPSession | None:
+    """Start Lucid's MCP client and discover its tools, or return None.
+
+    Only called when `LUCID_MCP_ENABLED` is true. Any failure (unreachable,
+    unauthorised, ...) prints a warning and returns None, so the diagram lane
+    keeps its local tool instead of taking the whole app down.
+
+    Limitation: Lucid's default auth is per-user OAuth (Dynamic Client
+    Registration), which would need an `auth_provider=`; only a static bearer
+    token (`LUCID_MCP_AUTH_TOKEN`) is wired here. The original never exercised
+    this path either.
+    """
+    from strands.tools.mcp import MCPClient
+
+    headers = (
+        {"Authorization": f"Bearer {env.LUCID_MCP_AUTH_TOKEN}"}
+        if env.LUCID_MCP_AUTH_TOKEN
+        else None
+    )
+    client = MCPClient(url=env.LUCID_MCP_URL, headers=headers)
+    try:
+        client.start()
+        return MCPSession(client=client, tools=_list_all_tools(client))
+    except Exception as exc:  # noqa: BLE001 — an optional lane must not break startup
+        print(f"Lucid MCP unavailable ({type(exc).__name__}: {exc}); "
+              "the diagram lane continues with its local tool only.")
+        try:
+            client.stop(None, None, None)  # don't leak a half-started thread
+        except Exception:  # noqa: BLE001
+            pass
+        return None
